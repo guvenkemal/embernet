@@ -50,11 +50,11 @@ enum Commands {
         channel: String,
         #[arg(long)]
         title: Option<String>,
-        #[arg(long)]
+        #[arg(long, num_args = 1..)]
         tags: Vec<String>,
         #[arg(long)]
         body: String,
-        #[arg(long)]
+        #[arg(long, num_args = 1..)]
         refs: Vec<String>,
     },
 
