@@ -60,4 +60,20 @@ Embernet is currently exploring a pragmatic middle ground:
 - A documentation-first repository where protocol decisions are captured as living design artifacts.
 - A small Have/Want synchronization layer that can evolve without requiring an external database.
 
+## Adjacent inspirations (non-protocol)
+
+These systems influenced Embernet's design but are communication/coordination models rather than direct protocol peers.
+
+### IRC
+
+IRC channels, simplicity, and real-time text are a direct ancestor. Embernet channels use a similar name structure (`tech/linux`) but diverge by adding signed auth, persistent append-only history, and offline-first sync.
+
+### Reddit
+
+Forum-style threaded discussions with moderation and community scoping. Embernet borrows the channel-as-topic convention but replaces centralized moderation with signed identities and local-first storage.
+
+### Git
+
+Signed commits and Git's Merkle DAG inspired Embernet's use of content-addressed IDs (BLAKE3) and signed envelopes. The `.ndjson` log is intentionally simpler than a commit graph, but the integrity model — every entry is verifiable — comes from Git.
+
 Related: [[../protocol/protocol]]
