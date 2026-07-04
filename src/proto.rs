@@ -1,9 +1,7 @@
 use anyhow::{Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD as b64};
-use blake3;
 use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use hex;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 

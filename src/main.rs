@@ -1,6 +1,8 @@
+mod mcp;
 mod proto;
 mod server;
 mod store;
+mod sync;
 mod util;
 
 use crate::proto::{Envelope, KeypairFile, Message};
@@ -68,6 +70,18 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:4444")]
         listen: String,
     },
+
+    /// Run an MCP server over stdio for local AI clients
+    Mcp,
+
+    /// Sync messages from a remote peer via WebSocket Have/Want protocol
+    Sync {
+        /// Remote peer URL (e.g. ws://127.0.0.1:4444/sync)
+        #[arg(long)]
+        peer: String,
+        /// Channel to sync
+        channel: String,
+    },
 }
 
 #[tokio::main]
@@ -125,6 +139,16 @@ async fn main() -> Result<()> {
         }
         Commands::Serve { listen } => {
             server::run(datadir, listen).await?;
+        }
+        Commands::Mcp => {
+            mcp::run_stdio(datadir)?;
+        }
+        Commands::Sync { peer, channel } => {
+            let received = sync::sync_from_peer(&datadir, &peer, &channel).await?;
+            println!(
+                "synced {} messages from {} for channel '{}'",
+                received, peer, channel
+            );
         }
     }
 
