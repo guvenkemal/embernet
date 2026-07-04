@@ -37,6 +37,13 @@ pub fn create_channel(base: &Path, chan: &ChannelRef) -> Result<()> {
 
 pub fn append_message(base: &Path, chan: &ChannelRef, env: &Envelope) -> Result<String> {
     let p = channel_to_path(base, &chan.full_name).join("log.ndjson");
+
+    // Dedup: skip if this id already exists in the log.
+    if p.exists() && log_contains_id(&p, &env.id)? {
+        tracing::debug!("append_message: duplicate id {}, skipping", env.id);
+        return Ok(env.id.clone());
+    }
+
     let mut f = OpenOptions::new()
         .create(true)
         .append(true)
@@ -45,6 +52,23 @@ pub fn append_message(base: &Path, chan: &ChannelRef, env: &Envelope) -> Result<
     serde_json::to_writer(&mut f, &env)?;
     f.write_all(b"\n")?;
     Ok(env.id.clone())
+}
+
+/// Check whether a log file already contains a line with the given id.
+///
+/// The id is a 64-char hex string (blake3 output). We scan each line
+/// for the id substring — false positives are astronomically unlikely
+/// and this avoids deserializing every envelope.
+fn log_contains_id(path: &Path, id: &str) -> Result<bool> {
+    let file = OpenOptions::new().read(true).open(path)?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        if line.contains(id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn read_channel_tail(base: &Path, chan: &ChannelRef, n: usize) -> Result<Vec<Envelope>> {
@@ -109,4 +133,85 @@ pub fn read_channel_from(base: &Path, chan: &ChannelRef, from: u64) -> Result<Ve
         out.push(env);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::{Envelope, KeypairFile, Message};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("embernet_test_{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn append_then_count() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+
+        let chan = ChannelRef::parse("test/chan").unwrap();
+        create_channel(&base, &chan).unwrap();
+
+        let kp = KeypairFile::generate(Some("tester".into()));
+        let msg = Message::new_text(None, vec![], "hello".into(), vec![]);
+        let env = Envelope::sign(kp, &chan.full_name, msg).unwrap();
+
+        let id = append_message(&base, &chan, &env).unwrap();
+        assert_eq!(id, env.id);
+        assert_eq!(count_messages(&base, &chan).unwrap(), 1);
+    }
+
+    #[test]
+    fn append_dedup_same_id() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+
+        let chan = ChannelRef::parse("test/chan").unwrap();
+        create_channel(&base, &chan).unwrap();
+
+        let kp = KeypairFile::generate(Some("tester".into()));
+        let msg = Message::new_text(None, vec![], "hello".into(), vec![]);
+        let env = Envelope::sign(kp, &chan.full_name, msg).unwrap();
+
+        // First append: succeeds, count = 1.
+        let id1 = append_message(&base, &chan, &env).unwrap();
+        assert_eq!(id1, env.id);
+        assert_eq!(count_messages(&base, &chan).unwrap(), 1);
+
+        // Second append with same envelope: returns same id, count still 1.
+        let id2 = append_message(&base, &chan, &env).unwrap();
+        assert_eq!(id2, env.id);
+        assert_eq!(count_messages(&base, &chan).unwrap(), 1);
+    }
+
+    #[test]
+    fn append_dedup_different_ids() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+
+        let chan = ChannelRef::parse("test/chan").unwrap();
+        create_channel(&base, &chan).unwrap();
+
+        let kp = KeypairFile::generate(Some("tester".into()));
+
+        let msg1 = Message::new_text(None, vec![], "first".into(), vec![]);
+        let env1 = Envelope::sign(kp.clone(), &chan.full_name, msg1).unwrap();
+        append_message(&base, &chan, &env1).unwrap();
+
+        let msg2 = Message::new_text(None, vec![], "second".into(), vec![]);
+        let env2 = Envelope::sign(kp, &chan.full_name, msg2).unwrap();
+        append_message(&base, &chan, &env2).unwrap();
+
+        // Two different messages, count = 2.
+        assert_eq!(count_messages(&base, &chan).unwrap(), 2);
+        // ids must differ.
+        assert_ne!(env1.id, env2.id);
+    }
 }
