@@ -105,7 +105,7 @@ Field meanings:
 | `from` | string | Hex-encoded Ed25519 public key. |
 | `from_alias` | string or null | Optional local display alias from the keypair file. |
 | `ts` | integer | Unix timestamp copied from `msg.ts`. |
-| `sig` | string | Hex-encoded Ed25519 signature over the JSON-serialized `Message`. |
+| `sig` | string | Hex-encoded Ed25519 signature over `(channel_bytes || '\n' || msg_bytes)`. |
 | `msg` | object | The signed message payload. |
 
 Example envelope:
@@ -139,18 +139,20 @@ The `from` and `sig` values above are illustrative placeholders. Real values mus
 When creating an envelope, the node:
 
 1. Serializes `msg` with `serde_json::to_vec(&msg)`.
-2. Computes `id = blake3(msg_bytes)` and hex-encodes it.
-3. Signs the same `msg_bytes` with the local Ed25519 signing key.
-4. Stores the signature as hex in `sig`.
+2. Computes `id = hex::encode(blake3(msg_bytes))` — a content-addressed message ID.
+3. Constructs the signing payload as `(channel_bytes || b'\n' || msg_bytes)` to bind the signature to the channel.
+4. Signs the payload with the local Ed25519 signing key.
+5. Stores the signature as hex in `sig`.
 
 When verifying an envelope, the node:
 
 1. Decodes `from` as a 32-byte Ed25519 public key.
 2. Serializes `msg` again with `serde_json::to_vec(&self.msg)`.
-3. Decodes `sig` as a 64-byte Ed25519 signature.
-4. Calls Ed25519 verification over the message bytes.
+3. Reconstructs the signing payload as `(channel_bytes || b'\n' || msg_bytes)`.
+4. Decodes `sig` as a 64-byte Ed25519 signature and calls Ed25519 verification over the payload.
+5. Recomputes `id = hex::encode(blake3(msg_bytes))` and compares it against `self.id`.
 
-Current verification checks the signature over the message payload. It does not currently recompute and compare `id`, and it does not include `channel` in the signature domain.
+Both checks must pass for `Envelope::verify()` to succeed — the signature must be valid for the claimed channel+message, and the content-id must match the actual message.
 
 ## Have/Want sync protocol
 
@@ -229,7 +231,5 @@ Invalid signatures fail the sync instead of being appended.
 - There is no deduplication by `id` on append.
 - The server currently streams server-to-client only for the requested channel.
 - `POST /sync` is not implemented in the current code; the active path is WebSocket `GET /sync`.
-- `channel` is not currently part of the signed message payload.
-- `id` is computed when signing but not recomputed inside `Envelope::verify()`.
 
 These limitations should be considered candidates for future ADRs in [[../decisions/README]].

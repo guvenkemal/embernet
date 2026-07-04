@@ -205,7 +205,7 @@ MCP results should expose the same `Envelope` JSON shape used by the log and syn
 Important implementation details:
 
 - `id` is currently the hex-encoded BLAKE3 hash of the JSON-serialized `Message`.
-- `sig` is an Ed25519 signature over the JSON-serialized `Message`.
+- `sig` is an Ed25519 signature over `(channel_bytes || '\n' || msg_bytes)`, binding it to the channel.
 - `from` is the hex-encoded Ed25519 public key.
 - `from_alias` is optional local metadata from the keypair file.
 - `msg.type` currently serializes as lowercase, for example `"post"`.
