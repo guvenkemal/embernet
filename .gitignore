@@ -2,3 +2,8 @@
 /data
 **/*.swp
 .obsidian
+.DS_STORE
+
+# Identity keypairs — contains Ed25519 private keys, never commit
+identity*.json
+*.identity.json
