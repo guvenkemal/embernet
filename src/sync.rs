@@ -1,15 +1,15 @@
 //! Have/Want sync protocol over WebSocket.
 //!
 //! Protocol:
-//!   1. Client connects via WS to `/sync`.
-//!   2. Client sends: `{"type":"status","channel":"<name>","count":<N>}`
-//!   3. Server compares its log count for that channel:
-//!       a. If server count <= client count → `{"type":"response","status":"up_to_date"}`
-//!       b. If server has more → streams each missing Envelope as a JSON text frame,
-//!          then sends `{"type":"response","status":"complete","sent":<N>}`
-//!   4. Client verifies each incoming Envelope with `Envelope::verify()` before
-//!      appending to its local log.
-//!   5. Either side may close the socket after the exchange.
+//!
+//! 1. Client connects via WS to `/sync`.
+//! 2. Client sends: `{"type":"status","channel":"<name>","count":<N>}`
+//! 3. Server compares its log count for that channel:
+//!    a. If server count <= client count → `{"type":"response","status":"up_to_date"}`
+//!    b. If server has more → streams each missing Envelope as a JSON text frame, then sends `{"type":"response","status":"complete","sent":<N>}`
+//! 4. Client verifies each incoming Envelope with `Envelope::verify()` before
+//!    appending to its local log.
+//! 5. Either side may close the socket after the exchange.
 
 use crate::proto::Envelope;
 use crate::store::{self, ChannelRef, append_message};
@@ -119,7 +119,7 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
 
     if server_count <= status_msg.count {
         // peer is up to date (or ahead — nothing to give)
-        ws.send(Message::Text(SyncResponse::up_to_date().to_json().into()))
+        ws.send(Message::Text(SyncResponse::up_to_date().to_json()))
             .await
             .context("send up_to_date")?;
         tracing::info!("sync: peer up to date, done.");
@@ -135,13 +135,13 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
 
     for env in &envelopes {
         let json = serde_json::to_string(env).context("serialize envelope")?;
-        ws.send(Message::Text(json.into()))
+        ws.send(Message::Text(json))
             .await
             .context("send envelope")?;
     }
 
     // ── 4. completion marker ──
-    ws.send(Message::Text(SyncResponse::complete(sent).to_json().into()))
+    ws.send(Message::Text(SyncResponse::complete(sent).to_json()))
         .await
         .context("send complete")?;
 

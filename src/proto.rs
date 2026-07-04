@@ -87,21 +87,33 @@ impl Message {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
-    pub id: String, // blake3(body)
+    pub id: String, // blake3(msg_bytes) — content hash
     pub channel: String,
     pub from: String, // pubkey hex
     pub from_alias: Option<String>,
     pub ts: i64,
-    pub sig: String, // ed25519 sig hex
+    pub sig: String, // ed25519 sig hex over (channel_bytes || b'\n' || msg_bytes)
     pub msg: Message,
 }
 
 impl Envelope {
+    /// Create a signed envelope.
+    ///
+    /// * `id` = blake3(serde_json(msg))
+    /// * `sig` = ed25519(channel_bytes || b'\n' || serde_json(msg))
     pub fn sign(kf: KeypairFile, channel: &str, msg: Message) -> Result<Self> {
-        let body_bytes = serde_json::to_vec(&msg)?;
-        let id = hex::encode(blake3::hash(&body_bytes).as_bytes());
+        let msg_bytes = serde_json::to_vec(&msg)?;
+        let id = hex::encode(blake3::hash(&msg_bytes).as_bytes());
+
+        // Sign over channel || separator || message to bind channel to signature
+        let channel_bytes = channel.as_bytes();
+        let mut signed_payload = Vec::with_capacity(channel_bytes.len() + 1 + msg_bytes.len());
+        signed_payload.extend_from_slice(channel_bytes);
+        signed_payload.push(b'\n');
+        signed_payload.extend_from_slice(&msg_bytes);
+
         let sk = kf.signing_key()?;
-        let sig = sk.sign(&body_bytes);
+        let sig = sk.sign(&signed_payload);
         Ok(Self {
             id,
             channel: channel.to_string(),
@@ -112,22 +124,149 @@ impl Envelope {
             msg,
         })
     }
+
+    /// Verify the envelope's signature and content-id integrity.
+    ///
+    /// Checks:
+    /// 1. The Ed25519 signature over `(channel || '\n' || serde_json(msg))`
+    ///    is valid for the claimed `from` public key.
+    /// 2. The `id` field matches blake3(serde_json(msg)) — closing the
+    ///    lying-id gap.
     pub fn verify(&self) -> Result<()> {
+        // ── recompute signed payload (channel || '\n' || msg_bytes) ──
+        let msg_bytes = serde_json::to_vec(&self.msg)?;
+        let channel_bytes = self.channel.as_bytes();
+        let mut signed_payload = Vec::with_capacity(channel_bytes.len() + 1 + msg_bytes.len());
+        signed_payload.extend_from_slice(channel_bytes);
+        signed_payload.push(b'\n');
+        signed_payload.extend_from_slice(&msg_bytes);
+
+        // ── verify signature ──
         let pk_bytes: [u8; 32] = hex::decode(&self.from)?
             .try_into()
             .map_err(|_| anyhow!("bad pk"))?;
         let pk = VerifyingKey::from_bytes(&pk_bytes)?;
-        let body = serde_json::to_vec(&self.msg)?;
         let sig_bytes: [u8; 64] = hex::decode(&self.sig)?
             .try_into()
             .map_err(|_| anyhow!("bad sig"))?;
         let sig = Signature::from_bytes(&sig_bytes);
-        pk.verify(&body, &sig)?;
+        pk.verify(&signed_payload, &sig)
+            .map_err(|e| anyhow!("signature verification failed: {e}"))?;
+
+        // ── verify id matches content ──
+        let expected_id = hex::encode(blake3::hash(&msg_bytes).as_bytes());
+        if self.id != expected_id {
+            return Err(anyhow!(
+                "id mismatch: claimed {} but computed {}",
+                self.id,
+                expected_id
+            ));
+        }
+
         Ok(())
     }
+
     pub fn body_text(&self) -> Option<&str> {
         match &self.msg.body {
             Body::Text { text } => Some(text.as_str()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn make_keypair(alias: &str) -> KeypairFile {
+        KeypairFile::generate(Some(alias.to_string()))
+    }
+
+    fn make_msg(body: &str) -> Message {
+        Message {
+            ts: Utc::now().timestamp(),
+            r#type: MsgType::Post,
+            title: Some("test".into()),
+            tags: vec!["test".into()],
+            refs: vec![],
+            body: Body::Text { text: body.into() },
+        }
+    }
+
+    #[test]
+    fn sign_verify_roundtrip() {
+        let kp = make_keypair("alice");
+        let msg = make_msg("hello embernet");
+        let env = Envelope::sign(kp, "tech/test", msg).unwrap();
+        env.verify().unwrap();
+    }
+
+    #[test]
+    fn tampered_sig_fails() {
+        let kp = make_keypair("alice");
+        let msg = make_msg("hello embernet");
+        let mut env = Envelope::sign(kp, "tech/test", msg).unwrap();
+
+        // flip last byte of signature
+        let mut sig_bytes = hex::decode(&env.sig).unwrap();
+        sig_bytes[63] ^= 1;
+        env.sig = hex::encode(&sig_bytes);
+
+        assert!(env.verify().is_err());
+    }
+
+    #[test]
+    fn tampered_body_fails() {
+        let kp = make_keypair("alice");
+        let msg = make_msg("hello embernet");
+        let mut env = Envelope::sign(kp, "tech/test", msg).unwrap();
+
+        // modify message body after signing
+        #[allow(irrefutable_let_patterns)]
+        if let Body::Text { ref mut text } = env.msg.body {
+            *text = "hacked!".into();
+        }
+
+        assert!(env.verify().is_err());
+    }
+
+    #[test]
+    fn wrong_channel_fails_signature() {
+        let kp = make_keypair("alice");
+        let msg = make_msg("hello embernet");
+        let mut env = Envelope::sign(kp, "tech/test", msg).unwrap();
+
+        // channel not included → signature should reject replay
+        env.channel = "evil/hijacked".into();
+        assert!(env.verify().is_err());
+    }
+
+    #[test]
+    fn mismatched_id_fails() {
+        let kp = make_keypair("alice");
+        let msg = make_msg("hello embernet");
+        let mut env = Envelope::sign(kp, "tech/test", msg).unwrap();
+
+        // Fabricate a different id
+        env.id = "deadbeef".repeat(8); // 64 hex chars
+        assert!(env.verify().is_err());
+    }
+
+    #[test]
+    fn keypair_generate_roundtrip() {
+        let kp = KeypairFile::generate(Some("bob".into()));
+        let temp = std::env::temp_dir().join("embernet_test_keypair.json");
+        kp.save(&temp).unwrap();
+        let loaded = KeypairFile::load(&temp).unwrap();
+        let _ = std::fs::remove_file(&temp);
+        assert_eq!(kp.public_key, loaded.public_key);
+        assert_eq!(kp.alias, loaded.alias);
+        // secret key round-trips through b64
+        let sk1 = kp.signing_key().unwrap();
+        let sk2 = loaded.signing_key().unwrap();
+        assert_eq!(
+            sk1.verifying_key().as_bytes(),
+            sk2.verifying_key().as_bytes()
+        );
     }
 }

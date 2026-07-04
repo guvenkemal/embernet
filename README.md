@@ -1,6 +1,7 @@
-# embernet (Phase 0)
+# embernet (Phase 1)
 
-Minimal local scaffold to post/tail messages in channels, with signed envelopes and file-backed logs. Networking is stubbed to a status endpoint; real federation comes in Phase 1.
+Decentralised coordination protocol with signed append-only logs,
+WebSocket Have/Want sync, and MCP AI-agent integration.
 
 ## Quickstart
 
@@ -8,43 +9,77 @@ Minimal local scaffold to post/tail messages in channels, with signed envelopes 
 # 0) build
 cargo build
 
-# 1) make a key
-./target/debug/embernet keygen --alias "You" --out identity.json
+# 1) set up a data directory (keep it outside the repo)
+mkdir -p ~/.embernet-test
 
-# 2) init data dir
-./target/debug/embernet --data ./data init --key identity.json
+# 2) make a key (in the data dir, not the repo root)
+./target/debug/embernet --data ~/.embernet-test keygen --alias "You" --out ~/.embernet-test/identity.json
 
-# 3) create a channel
-./target/debug/embernet --data ./data channel-create tech/discuss
+# 3) initialise the data dir
+./target/debug/embernet --data ~/.embernet-test init --key ~/.embernet-test/identity.json
 
-# 4) post something
-./target/debug/embernet --data ./data post tech/discuss \
+# 4) create a channel
+./target/debug/embernet --data ~/.embernet-test channel-create tech/discuss
+
+# 5) post something
+./target/debug/embernet --data ~/.embernet-test post tech/discuss \
   --title "hello world" --body "first post from the bunker" --tags linux rust
 
-# 5) tail
-./target/debug/embernet --data ./data tail tech/discuss --n 10
+# 6) tail
+./target/debug/embernet --data ~/.embernet-test tail tech/discuss --n 10
 
-# 6) status server
-./target/debug/embernet --data ./data serve --listen 127.0.0.1:4444
+# 7) start the HTTP + WebSocket server
+./target/debug/embernet --data ~/.embernet-test serve --listen 127.0.0.1:4444
 curl http://127.0.0.1:4444/status | jq
+
+# 8) sync from another node (after setting up a second data dir)
+./target/debug/embernet --data ~/.embernet-test-2 sync --peer ws://127.0.0.1:4444/sync tech/discuss
+
+# 9) run as an MCP stdio server for AI clients
+./target/debug/embernet --data ~/.embernet-test mcp
 ```
 
-## Notes
+## Protocol
 
-- Logs are **newline-delimited JSON** for readability. Switch to chunked segments + MessagePack later.
-- `id = blake3(serde_json(msg))`; `sig = ed25519(signing_key, msg_bytes)`.
-- This is enough to begin experimenting with UIs and to wire up Phase-1 sync (have/want + WebSocket) next.
+- **Envelope** = signed, content-addressed message with channel binding.
+  - `id = blake3(serde_json(msg))` — content hash.
+  - `sig = ed25519(channel || '\n' || serde_json(msg))` — channel-bound signature.
+  - `Envelope::verify()` checks both signature validity and id integrity.
+- **Storage** = append-only newline-delimited JSON (`.ndjson`) per channel.
+- **Sync** = WebSocket `GET /sync` with Have/Want exchange by channel count.
+- **MCP** = stdio JSON-RPC server exposing `list_channels`, `tail_channel`, `post_message`.
 
-## Scope (no Web3)
+Full specification: `docs/protocol/protocol.md`
 
-- Core spec is **offline-friendly**, federated via store-and-forward. No wallets, tokens, chains, or “anchors.”
-- Identity is **ed25519 keys** only. Optional DNS/GitHub text proofs later (purely off-chain).
-- Attachments are content-addressed locally; future IPFS support would be optional plugin-only, not required.
+## Commands
 
-## Next Up: Phase‑1 Sync Checklist
+```
+embernet keygen           Generate an ed25519 identity keypair
+embernet init             Initialise data directory with a keypair
+embernet channel-create   Create a channel
+embernet post             Post a signed text message
+embernet tail             Tail recent messages from a channel
+embernet serve            Run HTTP/WebSocket server (status + sync)
+embernet sync             Pull messages from a remote peer via Have/Want
+embernet mcp              Run as an MCP stdio server for AI clients
+```
 
-- [ ] WebSocket `/sync` endpoint with per-channel **have/want** exchange.
-- [ ] Chunked logs (`0000.msgpack`, `0001.msgpack`) + Merkle roots every N messages.
-- [ ] Peer ACLs (read/write/relay) + simple token auth for localhost UI.
-- [ ] Rate limiting + message/attachment caps.
-- [ ] ratatui TUI: channel list, message view, post box.
+## Scope
+
+- Offline-friendly, federated via store-and-forward.
+- Identity is **ed25519 keys** only. No wallets, tokens, or chains.
+- File-backed — no external database required.
+- AI-agent integration via MCP.
+
+## Documentation
+
+The `docs/` directory is an Obsidian-ready vault:
+
+- `docs/architecture/` — system design and roadmap.
+- `docs/protocol/` — envelope spec, sync protocol, MCP interface.
+- `docs/research/` — prior art (Nostr, Matrix, Scuttlebutt, IRC, Git).
+- `docs/decisions/` — Architecture Decision Records (ADRs).
+
+## License
+
+MIT or AGPL (TBD)

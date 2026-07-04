@@ -25,10 +25,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
-# optional: comment out if you don't want sqlite yet
-rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
-
 [profile.release]
 lto = true
 codegen-units = 1
-opt-level = "z"
+opt-level = 3

@@ -51,7 +51,7 @@ pub fn read_channel_tail(base: &Path, chan: &ChannelRef, n: usize) -> Result<Vec
     let p = channel_to_path(base, &chan.full_name).join("log.ndjson");
     let file = OpenOptions::new().read(true).open(&p)?;
     let reader = BufReader::new(file);
-    let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+    let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
     let start = lines.len().saturating_sub(n);
 
     let mut out = Vec::new();
@@ -78,7 +78,7 @@ pub fn count_messages(base: &Path, chan: &ChannelRef) -> Result<u64> {
     let reader = BufReader::new(file);
     let count = reader
         .lines()
-        .filter_map(|l| l.ok())
+        .map_while(Result::ok)
         .filter(|l| !l.trim().is_empty())
         .count() as u64;
     Ok(count)
@@ -92,7 +92,7 @@ pub fn read_channel_from(base: &Path, chan: &ChannelRef, from: u64) -> Result<Ve
     let reader = BufReader::new(file);
     let lines: Vec<String> = reader
         .lines()
-        .filter_map(|l| l.ok())
+        .map_while(Result::ok)
         .filter(|l| !l.trim().is_empty())
         .collect();
 

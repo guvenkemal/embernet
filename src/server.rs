@@ -40,12 +40,11 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut list = Vec::new();
     if let Ok(rd) = fs::read_dir(&ch_root) {
         for entry in rd.flatten() {
-            if let Ok(ft) = entry.file_type() {
-                if ft.is_dir() {
-                    if let Ok(name) = entry.file_name().into_string() {
-                        list.push(name);
-                    }
-                }
+            if let Ok(ft) = entry.file_type()
+                && ft.is_dir()
+                && let Ok(name) = entry.file_name().into_string()
+            {
+                list.push(name);
             }
         }
     }
