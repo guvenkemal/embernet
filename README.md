@@ -73,13 +73,44 @@ embernet mcp              Run as an MCP stdio server for AI clients
 
 ## Documentation
 
-The `docs/` directory is an Obsidian-ready vault:
+Embernet is a **documentation-first project**. The `docs/` directory is an Obsidian-ready
+vault that serves as the project's technical brain. Every design decision and protocol
+detail lives here — treat it as the authoritative source alongside the Rust source code.
 
-- `docs/architecture/` — system design and roadmap.
-- `docs/protocol/` — envelope spec, sync protocol, MCP interface.
-- `docs/research/` — prior art (Nostr, Matrix, Scuttlebutt, IRC, Git).
-- `docs/decisions/` — Architecture Decision Records (ADRs).
+### Key documents
+
+| Document | What it covers |
+|---|---|
+| [Protocol Specification](docs/protocol/protocol.md) | Envelope structure, signing/verification, `.ndjson` storage, Have/Want sync protocol, and current limitations. |
+| [MCP Interface](docs/protocol/mcp.md) | Tool definitions (`list_channels`, `tail_channel`, `post_message`), JSON-RPC examples, auth model, and error handling for AI agent integration. |
+| [Roadmap](docs/architecture/roadmap.md) | Phase 0 through Phase 2+ vision, current status, and architecture goals. |
+| [Prior Art](docs/research/prior-art.md) | Comparisons with Nostr, Matrix, Scuttlebutt, IRC, Reddit, and Git — what we borrow and what we do differently. |
+| [ADR 001 — ndjson logs](docs/decisions/adr-001-log-storage.md) | Why we chose newline-delimited JSON over SQLite and binary formats for channel logs. |
+| [ADR Template](docs/decisions/adr-template.md) | How to write an Architecture Decision Record for this project. |
+
+### Vault structure
+
+```
+docs/
+├── README.md                          ← vault index (open this folder in Obsidian)
+├── architecture/
+│   ├── README.md                      ← system design & module map
+│   └── roadmap.md                     ← current phase + future plans
+├── protocol/
+│   ├── README.md                      ← protocol overview
+│   ├── protocol.md                    ← full wire-format spec
+│   └── mcp.md                         ← MCP integration spec
+├── research/
+│   ├── README.md                      ← research index
+│   └── prior-art.md                   ← comparison with adjacent systems
+└── decisions/
+    ├── README.md                      ← decision log index
+    ├── adr-template.md                ← ADR template
+    └── adr-001-log-storage.md         ← why .ndjson for channel logs
+```
+
+Open the vault in Obsidian: **`Open folder as vault` → select `docs/`**.
 
 ## License
 
-MIT or AGPL (TBD)
+GNU Affero General Public License v3.0 (AGPL-3.0)
