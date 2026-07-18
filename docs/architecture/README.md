@@ -20,10 +20,10 @@ local CLI post
 
 remote sync
   -> WebSocket /sync
-  -> client status packet { channel, count }
-  -> server streams missing Envelope objects
-  -> client Envelope::verify()
-  -> append to local log.ndjson
+  -> client status packet { version, channel, ids }
+  -> server requests client-only ids
+  -> peers exchange missing Envelope objects in both directions
+  -> each peer Envelope::verify() + deduplicated append
 ```
 
 Related: [[../protocol/protocol]]

@@ -6,13 +6,17 @@ Use ADRs when a technical choice should be durable, reviewable, and understandab
 
 Start from [[adr-template]].
 
+## Accepted
+
+- [[adr-001-log-storage]] — Store channel logs as newline-delimited JSON.
+- [[adr-002-id-inventory-sync]] — Reconcile divergent peers by message-ID inventory.
+
 ## Suggested ADRs
 
 - Why Rust for the implementation language.
 - Why BLAKE3 for message IDs.
 - Why Ed25519 signatures for identity and integrity.
 - Why newline-delimited JSON (`.ndjson`) for the initial append-only log format.
-- Why WebSocket Have/Want sync for Phase 1 federation.
 
 ## Format
 

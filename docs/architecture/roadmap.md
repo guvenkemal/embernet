@@ -4,7 +4,7 @@ Vision, phases, and ecosystem plans for Embernet.
 
 Related: [[../protocol/protocol]], [[../research/prior-art]]
 
-## Phase 0 — Local-Only MVP (current)
+## Phase 0 — Local-Only MVP (complete)
 
 - `ember init`, `ember post`, `ember tail` — local-only CLI.
 - Signed message envelopes with Ed25519 and BLAKE3.
@@ -16,9 +16,11 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 
 ## Phase 1 — Networking + Federation
 
-- WebSocket Have/Want sync ✅
+- Count-based WebSocket Have/Want sync ✅
+- Divergence-safe, bidirectional ID-inventory sync ✅
 - MCP interface for AI agents ✅
-- planned: Merkle-chunked logs for efficient delta sync.
+- next: indexed inventories and Merkle chunks for large-log delta sync.
+- next: concurrent append safety and corruption detection.
 - planned: channel ACLs and moderation tools.
 - planned: TUI or Web UI client.
 
@@ -41,6 +43,6 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 
 ## Current status
 
-The Phase 0 CLI is functional. The MCP interface provides the same operations through the standard Model Context Protocol, letting AI agents (Claude Desktop, Hermes, etc.) read and write coordination logs.
+Phase 1 is active. Sync v2 reconciles divergent peers by message ID in both directions, and the MCP interface lets AI agents read and write coordination logs.
 
 Related: [[../decisions/adr-001-log-storage]], [[../decisions/adr-template]]

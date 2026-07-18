@@ -21,18 +21,20 @@ struct Status {
 }
 
 pub async fn run(datadir: PathBuf, listen: String) -> Result<()> {
-    let state = AppState {
-        datadir: datadir.clone(),
-    };
-    let app = Router::new()
-        .route("/status", get(status))
-        .route("/sync", get(ws_sync_handler))
-        .with_state(Arc::new(state));
+    let app = router(datadir);
 
     let addr: SocketAddr = listen.parse().expect("bad listen addr");
     tracing::info!("listening on {}", addr);
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
     Ok(())
+}
+
+pub(crate) fn router(datadir: PathBuf) -> Router {
+    let state = AppState { datadir };
+    Router::new()
+        .route("/status", get(status))
+        .route("/sync", get(ws_sync_handler))
+        .with_state(Arc::new(state))
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {

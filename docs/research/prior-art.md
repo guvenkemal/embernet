@@ -15,7 +15,7 @@ Useful ideas:
 Differences from Embernet:
 
 - Embernet currently stores channel logs as local append-only `.ndjson` files.
-- Embernet's current sync is Have/Want by channel count, not subscription filters.
+- Embernet's current sync is Have/Want by per-channel message-ID inventory, not subscription filters.
 - Embernet is oriented around project/community coordination logs rather than a global social event stream.
 
 ## Matrix

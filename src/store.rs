@@ -93,6 +93,7 @@ pub fn read_channel_tail(base: &Path, chan: &ChannelRef, n: usize) -> Result<Vec
 }
 
 /// Count total messages (non-empty lines) in a channel log.
+#[cfg(test)]
 pub fn count_messages(base: &Path, chan: &ChannelRef) -> Result<u64> {
     let p = channel_to_path(base, &chan.full_name).join("log.ndjson");
     if !p.exists() {
@@ -133,6 +134,20 @@ pub fn read_channel_from(base: &Path, chan: &ChannelRef, from: u64) -> Result<Ve
         out.push(env);
     }
     Ok(out)
+}
+
+/// Read and verify every envelope in a channel.
+pub fn read_channel_all(base: &Path, chan: &ChannelRef) -> Result<Vec<Envelope>> {
+    read_channel_from(base, chan, 0)
+}
+
+/// Return the ordered message-id inventory for a channel.
+#[cfg(test)]
+pub fn message_ids(base: &Path, chan: &ChannelRef) -> Result<Vec<String>> {
+    Ok(read_channel_all(base, chan)?
+        .into_iter()
+        .map(|env| env.id)
+        .collect())
 }
 
 #[cfg(test)]
@@ -213,5 +228,33 @@ mod tests {
         assert_eq!(count_messages(&base, &chan).unwrap(), 2);
         // ids must differ.
         assert_ne!(env1.id, env2.id);
+    }
+
+    #[test]
+    fn message_ids_preserve_log_order() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/chan").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let kp = KeypairFile::generate(Some("tester".into()));
+        let first = Envelope::sign(
+            kp.clone(),
+            &chan.full_name,
+            Message::new_text(None, vec![], "first".into(), vec![]),
+        )
+        .unwrap();
+        let second = Envelope::sign(
+            kp,
+            &chan.full_name,
+            Message::new_text(None, vec![], "second".into(), vec![]),
+        )
+        .unwrap();
+        append_message(&base, &chan, &first).unwrap();
+        append_message(&base, &chan, &second).unwrap();
+
+        assert_eq!(
+            message_ids(&base, &chan).unwrap(),
+            vec![first.id, second.id]
+        );
     }
 }

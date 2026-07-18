@@ -15,7 +15,7 @@ use std::path::PathBuf;
 #[command(
     name = "embernet",
     version,
-    about = "Underground chat/forum daemon (Phase 0)"
+    about = "Signed, federated coordination logs"
 )]
 struct Cli {
     /// Data directory
@@ -65,7 +65,7 @@ enum Commands {
         n: usize,
     },
 
-    /// Run local HTTP server (status + placeholder)
+    /// Run the HTTP status and WebSocket sync server
     Serve {
         #[arg(long, default_value = "127.0.0.1:4444")]
         listen: String,

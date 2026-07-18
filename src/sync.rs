@@ -1,263 +1,299 @@
-//! Have/Want sync protocol over WebSocket.
-//!
-//! Protocol:
-//!
-//! 1. Client connects via WS to `/sync`.
-//! 2. Client sends: `{"type":"status","channel":"<name>","count":<N>}`
-//! 3. Server compares its log count for that channel:
-//!    a. If server count <= client count → `{"type":"response","status":"up_to_date"}`
-//!    b. If server has more → streams each missing Envelope as a JSON text frame, then sends `{"type":"response","status":"complete","sent":<N>}`
-//! 4. Client verifies each incoming Envelope with `Envelope::verify()` before
-//!    appending to its local log.
-//! 5. Either side may close the socket after the exchange.
+//! Divergence-safe, bidirectional Have/Want sync over WebSocket.
 
 use crate::proto::Envelope;
+use crate::server::AppState;
 use crate::store::{self, ChannelRef, append_message};
 use anyhow::{Context, Result, bail};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::server::AppState;
+const SYNC_VERSION: u32 = 2;
+const MAX_INVENTORY_IDS: usize = 100_000;
 
-// ── wire types ────────────────────────────────────────────────────────────────
-
-/// Incoming status packet from the client.
 #[derive(Debug, Deserialize)]
 struct StatusMessage {
     #[serde(rename = "type")]
     msg_type: String,
+    version: u32,
     channel: String,
-    count: u64,
+    ids: Vec<String>,
 }
 
-/// Outgoing response from the server.
+#[derive(Debug, Serialize, Deserialize)]
+struct WantMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    ids: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SyncResponse {
     #[serde(rename = "type")]
-    msg_type: String, // "response"
-    status: String, // "up_to_date" | "complete" | "error"
+    msg_type: String,
+    status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     sent: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    received: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
 impl SyncResponse {
-    fn up_to_date() -> Self {
-        Self {
-            msg_type: "response".into(),
-            status: "up_to_date".into(),
-            sent: None,
-            error: None,
-        }
-    }
-
-    fn complete(sent: u64) -> Self {
+    fn complete(sent: u64, received: u64) -> Self {
         Self {
             msg_type: "response".into(),
             status: "complete".into(),
             sent: Some(sent),
+            received: Some(received),
             error: None,
         }
     }
 
-    #[allow(dead_code)]
-    fn error(msg: impl Into<String>) -> Self {
-        Self {
-            msg_type: "response".into(),
-            status: "error".into(),
-            sent: None,
-            error: Some(msg.into()),
-        }
-    }
-
     fn to_json(&self) -> String {
-        // unwrap is safe — SyncResponse is always serializable
-        serde_json::to_string(self).unwrap()
+        serde_json::to_string(self).expect("SyncResponse is serializable")
     }
 }
 
-// ── handler ───────────────────────────────────────────────────────────────────
-
-/// Handle a single WebSocket sync session.
-///
-/// Reads one status packet, compares channel counts, and streams
-/// any missing envelopes back to the peer.
 pub async fn handle_sync(ws: WebSocket, state: Arc<AppState>) {
     tracing::info!("sync: new websocket connection");
-
-    if let Err(e) = run_sync(ws, &state.datadir).await {
-        tracing::error!("sync session failed: {e:#}");
+    if let Err(error) = run_sync(ws, &state.datadir).await {
+        tracing::error!("sync session failed: {error:#}");
     }
 }
 
 async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
-    // ── 1. read the status packet ──
-    let status_msg = read_status(&mut ws).await?;
-
-    // validate channel name
-    let chan = ChannelRef::parse(&status_msg.channel).context("invalid channel name in status")?;
-
-    tracing::info!(
-        "sync: peer has {} messages for channel '{}'",
-        status_msg.count,
-        status_msg.channel
-    );
-
-    // ── 2. compare counts ──
-    let server_count = store::count_messages(datadir, &chan)
-        .with_context(|| format!("count_messages failed for {}", status_msg.channel))?;
-
-    tracing::info!(
-        "sync: server has {} messages for channel '{}'",
-        server_count,
-        status_msg.channel
-    );
-
-    if server_count <= status_msg.count {
-        // peer is up to date (or ahead — nothing to give)
-        ws.send(Message::Text(SyncResponse::up_to_date().to_json()))
-            .await
-            .context("send up_to_date")?;
-        tracing::info!("sync: peer up to date, done.");
-        return Ok(());
+    let status = read_status(&mut ws).await?;
+    if status.version != SYNC_VERSION {
+        bail!("unsupported sync version: {}", status.version);
     }
+    if status.ids.len() > MAX_INVENTORY_IDS {
+        bail!("inventory exceeds {MAX_INVENTORY_IDS} ids");
+    }
+    let chan = ChannelRef::parse(&status.channel).context("invalid channel name in status")?;
+    let server_envelopes = store::read_channel_all(datadir, &chan)?;
+    let server_ids: HashSet<&str> = server_envelopes.iter().map(|env| env.id.as_str()).collect();
+    let client_ids: HashSet<&str> = status.ids.iter().map(String::as_str).collect();
 
-    // ── 3. stream missing envelopes ──
-    let from = status_msg.count; // 0-indexed — skip what they already have
-    let envelopes = store::read_channel_from(datadir, &chan, from)
-        .with_context(|| format!("read_channel_from({}) failed", status_msg.channel))?;
+    let wanted_from_client: Vec<String> = status
+        .ids
+        .iter()
+        .filter(|id| !server_ids.contains(id.as_str()))
+        .cloned()
+        .collect();
+    let to_client: Vec<&Envelope> = server_envelopes
+        .iter()
+        .filter(|env| !client_ids.contains(env.id.as_str()))
+        .collect();
 
-    let sent = envelopes.len() as u64;
+    let want = WantMessage {
+        msg_type: "want".into(),
+        ids: wanted_from_client.clone(),
+    };
+    ws.send(Message::Text(serde_json::to_string(&want)?))
+        .await
+        .context("send want")?;
 
-    for env in &envelopes {
-        let json = serde_json::to_string(env).context("serialize envelope")?;
-        ws.send(Message::Text(json))
+    for env in &to_client {
+        ws.send(Message::Text(serde_json::to_string(env)?))
             .await
             .context("send envelope")?;
     }
 
-    // ── 4. completion marker ──
-    ws.send(Message::Text(SyncResponse::complete(sent).to_json()))
-        .await
-        .context("send complete")?;
+    let wanted: HashSet<String> = wanted_from_client.into_iter().collect();
+    let mut received = 0_u64;
+    while received < wanted.len() as u64 {
+        let msg = ws.next().await.context("peer closed during upload")??;
+        let Message::Text(text) = msg else {
+            continue;
+        };
+        let env: Envelope = serde_json::from_str(&text).context("deserialize uploaded envelope")?;
+        if !wanted.contains(&env.id) {
+            bail!("client uploaded unrequested envelope {}", env.id);
+        }
+        if env.channel != chan.full_name {
+            bail!("uploaded envelope {} belongs to {}", env.id, env.channel);
+        }
+        env.verify()
+            .with_context(|| format!("verify uploaded envelope {}", env.id))?;
+        append_message(datadir, &chan, &env)?;
+        received += 1;
+    }
 
-    tracing::info!("sync: sent {sent} envelopes, done.");
+    let sent = to_client.len() as u64;
+    ws.send(Message::Text(
+        SyncResponse::complete(sent, received).to_json(),
+    ))
+    .await
+    .context("send complete")?;
+    tracing::info!("sync: sent {sent}, received {received}");
     Ok(())
 }
 
-/// Read exactly one text message from the socket and deserialize as StatusMessage.
 async fn read_status(ws: &mut WebSocket) -> Result<StatusMessage> {
     let msg = ws
         .next()
         .await
         .context("ws closed before status")?
         .context("ws error reading status")?;
-
-    let text = match msg {
-        Message::Text(t) => t.to_string(),
-        Message::Close(_) => bail!("peer closed before sending status"),
-        other => bail!("expected text status, got {other:?}"),
+    let Message::Text(text) = msg else {
+        bail!("expected text status");
     };
-
-    serde_json::from_str::<StatusMessage>(&text)
-        .context("invalid status packet")
-        .and_then(|s| {
-            if s.msg_type != "status" {
-                bail!("expected type=status, got type={}", s.msg_type);
-            }
-            Ok(s)
-        })
+    let status: StatusMessage = serde_json::from_str(&text).context("invalid status packet")?;
+    if status.msg_type != "status" {
+        bail!("expected type=status, got type={}", status.msg_type);
+    }
+    Ok(status)
 }
 
-// ── client-side sync helper ───────────────────────────────────────────────────
-
-/// Connect to a remote peer's `/sync` endpoint, send a status packet,
-/// and receive+verify+append any missing envelopes.
-///
-/// This is intended for CLI-driven or background sync — it opens a
-/// client WebSocket, performs the Have/Want handshake, and writes
-/// verified envelopes into the local store.
 pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Result<u64> {
-    use futures_util::StreamExt;
     use tokio_tungstenite::connect_async;
 
     let chan = ChannelRef::parse(channel)?;
-    let local_count = store::count_messages(datadir, &chan)?;
-
-    // Build the status packet
+    let local_envelopes = store::read_channel_all(datadir, &chan)?;
+    let local_ids: Vec<String> = local_envelopes.iter().map(|env| env.id.clone()).collect();
     let status = serde_json::json!({
         "type": "status",
+        "version": SYNC_VERSION,
         "channel": channel,
-        "count": local_count,
+        "ids": local_ids,
     });
 
-    tracing::info!(
-        "sync_client: connecting to {} for channel '{}' (local count={})",
-        peer_url,
-        channel,
-        local_count
-    );
+    let (mut ws, _) = connect_async(peer_url).await.context("connect to peer")?;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        status.to_string(),
+    ))
+    .await
+    .context("send status to peer")?;
 
-    let (mut ws_stream, _) = connect_async(peer_url).await.context("connect to peer")?;
-
-    // Send our status
-    ws_stream
-        .send(tokio_tungstenite::tungstenite::Message::Text(
-            status.to_string(),
-        ))
-        .await
-        .context("send status to peer")?;
-
-    let mut received: u64 = 0;
-
-    // Read responses: envelope JSON frames, then the final response frame
-    while let Some(msg) = ws_stream.next().await {
+    let mut received = 0_u64;
+    while let Some(msg) = ws.next().await {
         let msg = msg.context("ws read error")?;
-        let text = match msg {
-            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
-            tokio_tungstenite::tungstenite::Message::Close(_) => break,
-            _ => continue,
+        let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+            continue;
         };
 
-        // Try deserializing as a response frame first
-        if let Ok(resp) = serde_json::from_str::<SyncResponse>(&text) {
-            match resp.status.as_str() {
-                "up_to_date" => {
-                    tracing::info!("sync_client: already up to date");
-                    break;
-                }
-                "complete" => {
-                    tracing::info!(
-                        "sync_client: sync complete, received {} envelopes",
-                        received
-                    );
-                    break;
-                }
-                "error" => {
-                    bail!("peer error: {}", resp.error.as_deref().unwrap_or("unknown"));
-                }
-                _ => {
-                    tracing::warn!("sync_client: unexpected response status: {}", resp.status);
-                    break;
-                }
+        if let Ok(response) = serde_json::from_str::<SyncResponse>(&text) {
+            if response.status == "complete" {
+                break;
+            }
+            if response.status == "error" {
+                bail!(
+                    "peer error: {}",
+                    response.error.as_deref().unwrap_or("unknown")
+                );
             }
         }
 
-        // Otherwise, treat it as an envelope
+        if let Ok(want) = serde_json::from_str::<WantMessage>(&text)
+            && want.msg_type == "want"
+        {
+            let wanted: HashSet<&str> = want.ids.iter().map(String::as_str).collect();
+            for env in local_envelopes
+                .iter()
+                .filter(|env| wanted.contains(env.id.as_str()))
+            {
+                ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::to_string(env)?,
+                ))
+                .await
+                .context("upload wanted envelope")?;
+            }
+            continue;
+        }
+
         let env: Envelope = serde_json::from_str(&text).context("deserialize envelope")?;
-
-        // ── integrity check ──
+        if env.channel != chan.full_name {
+            bail!("downloaded envelope {} belongs to {}", env.id, env.channel);
+        }
         env.verify()
-            .with_context(|| format!("signature verification failed for {}", env.id))?;
-
-        // Append to local log
+            .with_context(|| format!("verify downloaded envelope {}", env.id))?;
         append_message(datadir, &chan, &env)?;
         received += 1;
     }
-
     Ok(received)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::{KeypairFile, Message};
+    use crate::store::{create_channel, init_layout, message_ids};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("embernet_sync_{label}_{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn add_message(base: &Path, chan: &ChannelRef, body: &str) -> String {
+        let env = Envelope::sign(
+            KeypairFile::generate(Some(body.into())),
+            &chan.full_name,
+            Message::new_text(None, vec![], body.into(), vec![]),
+        )
+        .unwrap();
+        append_message(base, chan, &env).unwrap();
+        env.id
+    }
+
+    #[tokio::test]
+    async fn equal_length_divergent_peers_converge() {
+        let server_dir = temp_dir("server");
+        let client_dir = temp_dir("client");
+        let chan = ChannelRef::parse("test/divergence").unwrap();
+        for dir in [&server_dir, &client_dir] {
+            init_layout(dir).unwrap();
+            create_channel(dir, &chan).unwrap();
+        }
+        let server_id = add_message(&server_dir, &chan, "from server");
+        let client_id = add_message(&client_dir, &chan, "from client");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::server::router(server_dir.clone());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let received = sync_from_peer(&client_dir, &format!("ws://{addr}/sync"), &chan.full_name)
+            .await
+            .unwrap();
+        task.abort();
+
+        assert_eq!(received, 1);
+        let expected: HashSet<String> = [server_id, client_id].into_iter().collect();
+        assert_eq!(
+            message_ids(&server_dir, &chan)
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            message_ids(&client_dir, &chan)
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            expected
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::server::router(server_dir.clone());
+        let retry_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let retry_received =
+            sync_from_peer(&client_dir, &format!("ws://{addr}/sync"), &chan.full_name)
+                .await
+                .unwrap();
+        retry_task.abort();
+        assert_eq!(retry_received, 0);
+    }
 }

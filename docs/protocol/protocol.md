@@ -162,15 +162,17 @@ The current sync protocol is implemented over WebSocket at:
 GET /sync
 ```
 
-The client sends one status packet after the WebSocket opens.
+Sync v2 reconciles one channel per connection. The initiating peer sends its complete
+message-ID inventory after the WebSocket opens.
 
 ### Client status packet
 
 ```json
 {
   "type": "status",
+  "version": 2,
   "channel": "tech/linux",
-  "count": 15
+  "ids": ["4f...", "a2..."]
 }
 ```
 
@@ -179,29 +181,25 @@ Fields:
 | Field | Type | Description |
 | --- | --- | --- |
 | `type` | string | Must be `"status"`. |
+| `version` | integer | Must be `2`. |
 | `channel` | string | Channel to synchronize. |
-| `count` | integer | Number of local non-empty log entries the client already has for the channel. |
+| `ids` | array | Ordered IDs of every local envelope in the channel. |
 
 ### Server behavior
 
-The server parses and validates the channel name, then counts its own local messages for the requested channel.
-
-If the server has no additional messages:
+The server validates the channel and version, reads its verified local inventory,
+and requests IDs that exist only on the client:
 
 ```json
 {
-  "type": "response",
-  "status": "up_to_date"
+  "type": "want",
+  "ids": ["4f..."]
 }
 ```
 
-This is sent when:
-
-```text
-server_count <= client_count
-```
-
-If the server has more messages, it reads from the client's count offset and streams each missing `Envelope` as a JSON text frame.
+The server streams every local envelope absent from the client's inventory. The
+client responds to the `want` frame by uploading the requested envelopes. Envelope
+frames use the normal envelope JSON representation and have no `type` field.
 
 After all missing envelopes have been sent, the server sends a completion frame:
 
@@ -209,27 +207,22 @@ After all missing envelopes have been sent, the server sends a completion frame:
 {
   "type": "response",
   "status": "complete",
-  "sent": 3
+  "sent": 3,
+  "received": 1
 }
 ```
 
 ### Client receive behavior
 
-For each text frame received from the peer, the client first tries to parse it as a sync response. If it is not a response, the client treats it as an `Envelope`.
-
-For each received envelope, the client:
-
-1. Deserializes the JSON into `Envelope`.
-2. Calls `Envelope::verify()`.
-3. Appends the verified envelope to the local channel's `log.ndjson`.
-
-Invalid signatures fail the sync instead of being appended.
+Both peers verify every received envelope before appending it. An envelope not
+explicitly requested by the server fails the exchange. Append deduplicates by ID,
+so retrying a partially completed sync is safe.
 
 ## Current limitations
 
-- Sync is count-based. It assumes peers share the same ordered prefix for a channel.
-- There is no deduplication by `id` on append.
-- The server currently streams server-to-client only for the requested channel.
+- Inventories are linear in channel size and capped at 100,000 IDs per exchange.
+- One channel is reconciled per WebSocket connection.
+- Logs do not yet use locking or a persistent ID index.
 - `POST /sync` is not implemented in the current code; the active path is WebSocket `GET /sync`.
 
 These limitations should be considered candidates for future ADRs in [[../decisions/README]].
