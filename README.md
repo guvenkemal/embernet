@@ -45,7 +45,7 @@ curl http://127.0.0.1:4444/status | jq
   - `id = blake3(serde_json(msg))` — content hash.
   - `sig = ed25519(channel || '\n' || serde_json(msg))` — channel-bound signature.
   - `Envelope::verify()` checks both signature validity and id integrity.
-- **Storage** = append-only newline-delimited JSON (`.ndjson`) per channel.
+- **Storage** = append-only newline-delimited JSON (`.ndjson`) with a rebuildable per-channel ID index.
 - **Sync** = WebSocket `GET /sync` with bidirectional Have/Want exchange by message ID.
 - **MCP** = stdio JSON-RPC server exposing `list_channels`, `tail_channel`, `post_message`.
 

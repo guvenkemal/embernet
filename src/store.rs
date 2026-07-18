@@ -2,9 +2,21 @@ use crate::proto::Envelope;
 use crate::util::{channel_to_path, ensure_dir, valid_channel};
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+const INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("messages");
+const INDEX_META: TableDefinition<&str, u64> = TableDefinition::new("metadata");
+const INDEX_LOG_LEN: &str = "log_len";
+
+#[derive(Debug)]
+struct ScannedEnvelope {
+    envelope: Envelope,
+    offset: u64,
+    length: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct ChannelRef {
@@ -64,9 +76,8 @@ pub fn append_message(base: &Path, chan: &ChannelRef, env: &Envelope) -> Result<
         .with_context(|| format!("open {}", p.display()))?;
     FileExt::lock_exclusive(&file).with_context(|| format!("lock {}", p.display()))?;
 
-    file.seek(SeekFrom::Start(0))?;
-    let existing = read_verified_file(&mut file, &p)?;
-    if existing.iter().any(|existing| existing.id == env.id) {
+    let db = ensure_index(&mut file, &p)?;
+    if index_contains(&db, &env.id)? {
         tracing::debug!("append_message: duplicate id {}, skipping", env.id);
         return Ok(env.id.clone());
     }
@@ -77,7 +88,99 @@ pub fn append_message(base: &Path, chan: &ChannelRef, env: &Envelope) -> Result<
         .with_context(|| format!("flush {}", p.display()))?;
     file.sync_data()
         .with_context(|| format!("sync {}", p.display()))?;
+    let offset = file.metadata()?.len() - record.len() as u64;
+    index_insert(
+        &db,
+        &env.id,
+        offset,
+        record.len() as u64,
+        file.metadata()?.len(),
+    )?;
     Ok(env.id.clone())
+}
+
+fn index_path(log_path: &Path) -> PathBuf {
+    log_path.with_file_name("index.redb")
+}
+
+fn encode_location(offset: u64, length: u64) -> [u8; 16] {
+    let mut value = [0_u8; 16];
+    value[..8].copy_from_slice(&offset.to_be_bytes());
+    value[8..].copy_from_slice(&length.to_be_bytes());
+    value
+}
+
+fn decode_location(value: &[u8]) -> Result<(u64, u64)> {
+    if value.len() != 16 {
+        bail!("invalid index location length {}", value.len());
+    }
+    let offset = u64::from_be_bytes(value[..8].try_into()?);
+    let length = u64::from_be_bytes(value[8..].try_into()?);
+    Ok((offset, length))
+}
+
+fn ensure_index(log: &mut std::fs::File, log_path: &Path) -> Result<Database> {
+    let path = index_path(log_path);
+    let log_len = log.metadata()?.len();
+    let db = Database::create(&path).with_context(|| format!("open {}", path.display()))?;
+    let current_len = {
+        let read = db.begin_read()?;
+        match read.open_table(INDEX_META) {
+            Ok(table) => table.get(INDEX_LOG_LEN)?.map(|value| value.value()),
+            Err(_) => None,
+        }
+    };
+    if current_len != Some(log_len) {
+        rebuild_index(&db, log, log_path, log_len)?;
+    }
+    Ok(db)
+}
+
+fn rebuild_index(
+    db: &Database,
+    log: &mut std::fs::File,
+    log_path: &Path,
+    log_len: u64,
+) -> Result<()> {
+    log.seek(SeekFrom::Start(0))?;
+    let scanned = scan_verified_file(log, log_path)?;
+    let write = db.begin_write()?;
+    let _ = write.delete_table(INDEX);
+    let _ = write.delete_table(INDEX_META);
+    {
+        let mut index = write.open_table(INDEX)?;
+        for item in scanned {
+            let location = encode_location(item.offset, item.length);
+            index.insert(item.envelope.id.as_str(), location.as_slice())?;
+        }
+    }
+    {
+        let mut meta = write.open_table(INDEX_META)?;
+        meta.insert(INDEX_LOG_LEN, log_len)?;
+    }
+    write.commit()?;
+    Ok(())
+}
+
+fn index_contains(db: &Database, id: &str) -> Result<bool> {
+    let read = db.begin_read()?;
+    let table = read.open_table(INDEX)?;
+    Ok(table.get(id)?.is_some())
+}
+
+fn index_insert(db: &Database, id: &str, offset: u64, length: u64, log_len: u64) -> Result<()> {
+    let location = encode_location(offset, length);
+    let write = db.begin_write()?;
+    {
+        let mut index = write.open_table(INDEX)?;
+        index.insert(id, location.as_slice())?;
+    }
+    {
+        let mut meta = write.open_table(INDEX_META)?;
+        meta.insert(INDEX_LOG_LEN, log_len)?;
+    }
+    write.commit()?;
+    Ok(())
 }
 
 fn read_verified_log(path: &Path) -> Result<Vec<Envelope>> {
@@ -90,6 +193,13 @@ fn read_verified_log(path: &Path) -> Result<Vec<Envelope>> {
 }
 
 fn read_verified_file(file: &mut std::fs::File, path: &Path) -> Result<Vec<Envelope>> {
+    Ok(scan_verified_file(file, path)?
+        .into_iter()
+        .map(|item| item.envelope)
+        .collect())
+}
+
+fn scan_verified_file(file: &mut std::fs::File, path: &Path) -> Result<Vec<ScannedEnvelope>> {
     let mut reader = BufReader::new(file);
     let mut envelopes = Vec::new();
     let mut bytes = Vec::new();
@@ -104,6 +214,8 @@ fn read_verified_file(file: &mut std::fs::File, path: &Path) -> Result<Vec<Envel
             break;
         }
         line_number += 1;
+        let length = read as u64;
+        let offset = reader.stream_position()? - length;
         if !bytes.ends_with(b"\n") {
             bail!(
                 "corrupt log {} at line {}: truncated record (missing newline)",
@@ -134,7 +246,11 @@ fn read_verified_file(file: &mut std::fs::File, path: &Path) -> Result<Vec<Envel
                 env.id
             )
         })?;
-        envelopes.push(env);
+        envelopes.push(ScannedEnvelope {
+            envelope: env,
+            offset,
+            length,
+        });
     }
     Ok(envelopes)
 }
@@ -158,6 +274,7 @@ pub fn count_messages(base: &Path, chan: &ChannelRef) -> Result<u64> {
 
 /// Read envelopes starting from `from` (0-indexed) to end of log.
 /// Each envelope is verified before being returned.
+#[cfg(test)]
 pub fn read_channel_from(base: &Path, chan: &ChannelRef, from: u64) -> Result<Vec<Envelope>> {
     let p = channel_to_path(base, &chan.full_name).join("log.ndjson");
     let envelopes = read_verified_log(&p)?;
@@ -169,17 +286,58 @@ pub fn read_channel_from(base: &Path, chan: &ChannelRef, from: u64) -> Result<Ve
 }
 
 /// Read and verify every envelope in a channel.
+#[cfg(test)]
 pub fn read_channel_all(base: &Path, chan: &ChannelRef) -> Result<Vec<Envelope>> {
     read_channel_from(base, chan, 0)
 }
 
 /// Return the ordered message-id inventory for a channel.
-#[cfg(test)]
 pub fn message_ids(base: &Path, chan: &ChannelRef) -> Result<Vec<String>> {
-    Ok(read_channel_all(base, chan)?
-        .into_iter()
-        .map(|env| env.id)
-        .collect())
+    let log_path = channel_to_path(base, &chan.full_name).join("log.ndjson");
+    let mut log = OpenOptions::new().read(true).open(&log_path)?;
+    FileExt::lock_exclusive(&log).with_context(|| format!("lock {}", log_path.display()))?;
+    let db = ensure_index(&mut log, &log_path)?;
+    let read = db.begin_read()?;
+    let table = read.open_table(INDEX)?;
+    let mut entries = Vec::new();
+    for entry in table.iter()? {
+        let (id, location) = entry?;
+        let (offset, _) = decode_location(location.value())?;
+        entries.push((offset, id.value().to_string()));
+    }
+    entries.sort_by_key(|(offset, _)| *offset);
+    Ok(entries.into_iter().map(|(_, id)| id).collect())
+}
+
+/// Read and verify one envelope using its indexed byte range.
+pub fn read_message_by_id(base: &Path, chan: &ChannelRef, id: &str) -> Result<Envelope> {
+    let log_path = channel_to_path(base, &chan.full_name).join("log.ndjson");
+    let mut log = OpenOptions::new().read(true).open(&log_path)?;
+    FileExt::lock_exclusive(&log).with_context(|| format!("lock {}", log_path.display()))?;
+    let db = ensure_index(&mut log, &log_path)?;
+    let location = {
+        let read = db.begin_read()?;
+        let table = read.open_table(INDEX)?;
+        let value = table
+            .get(id)?
+            .with_context(|| format!("message {id} is not indexed"))?;
+        decode_location(value.value())?
+    };
+    let (offset, length) = location;
+    log.seek(SeekFrom::Start(offset))?;
+    let mut record = vec![0_u8; length as usize];
+    log.read_exact(&mut record)?;
+    if record.pop() != Some(b'\n') {
+        bail!("corrupt indexed record {id}: missing newline");
+    }
+    let env: Envelope = serde_json::from_slice(&record)
+        .with_context(|| format!("corrupt indexed record {id}: invalid JSON"))?;
+    if env.id != id || env.channel != chan.full_name {
+        bail!("corrupt indexed record {id}: identity or channel mismatch");
+    }
+    env.verify()
+        .with_context(|| format!("corrupt indexed record {id}: failed verification"))?;
+    Ok(env)
 }
 
 #[cfg(test)]
@@ -284,6 +442,67 @@ mod tests {
         .unwrap();
         append_message(&base, &chan, &first).unwrap();
         append_message(&base, &chan, &second).unwrap();
+
+        assert_eq!(
+            message_ids(&base, &chan).unwrap(),
+            vec![first.id, second.id]
+        );
+    }
+
+    #[test]
+    fn missing_index_is_rebuilt_from_existing_log() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/index").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let env = Envelope::sign(
+            KeypairFile::generate(Some("tester".into())),
+            &chan.full_name,
+            Message::new_text(None, vec![], "pre-index".into(), vec![]),
+        )
+        .unwrap();
+        let log_path = channel_to_path(&base, &chan.full_name).join("log.ndjson");
+        let mut record = serde_json::to_vec(&env).unwrap();
+        record.push(b'\n');
+        std::fs::write(&log_path, record).unwrap();
+
+        assert_eq!(message_ids(&base, &chan).unwrap(), vec![env.id.clone()]);
+        assert!(index_path(&log_path).exists());
+        assert_eq!(
+            read_message_by_id(&base, &chan, &env.id).unwrap().id,
+            env.id
+        );
+    }
+
+    #[test]
+    fn stale_index_is_rebuilt_after_unindexed_log_append() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/index").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let key = KeypairFile::generate(Some("tester".into()));
+        let first = Envelope::sign(
+            key.clone(),
+            &chan.full_name,
+            Message::new_text(None, vec![], "first".into(), vec![]),
+        )
+        .unwrap();
+        let second = Envelope::sign(
+            key,
+            &chan.full_name,
+            Message::new_text(None, vec![], "second".into(), vec![]),
+        )
+        .unwrap();
+        append_message(&base, &chan, &first).unwrap();
+        let log_path = channel_to_path(&base, &chan.full_name).join("log.ndjson");
+        let mut record = serde_json::to_vec(&second).unwrap();
+        record.push(b'\n');
+        OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap()
+            .write_all(&record)
+            .unwrap();
 
         assert_eq!(
             message_ids(&base, &chan).unwrap(),

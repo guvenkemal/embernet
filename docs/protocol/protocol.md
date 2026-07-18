@@ -28,6 +28,11 @@ A final record without a newline is treated as truncated. Invalid JSON, failed
 envelope verification, and read errors are treated as corruption and include the
 log path and line number in the reported error.
 
+Each channel also has a rebuildable `index.redb` sidecar mapping message IDs to
+record byte offsets and lengths. The index stores the log length it describes. A
+missing or stale index is rebuilt from the verified log while holding the channel
+lock; `log.ndjson` remains the source of truth.
+
 ## Channel names
 
 Channel names are parsed by `ChannelRef::parse` and validated by `valid_channel`.
@@ -229,7 +234,7 @@ so retrying a partially completed sync is safe.
 
 - Inventories are linear in channel size and capped at 100,000 IDs per exchange.
 - One channel is reconciled per WebSocket connection.
-- Logs do not yet use a persistent ID index.
+- Full ID inventories are still enumerated for every sync exchange.
 - `POST /sync` is not implemented in the current code; the active path is WebSocket `GET /sync`.
 
 These limitations should be considered candidates for future ADRs in [[../decisions/README]].

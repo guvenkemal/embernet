@@ -75,8 +75,8 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
         bail!("inventory exceeds {MAX_INVENTORY_IDS} ids");
     }
     let chan = ChannelRef::parse(&status.channel).context("invalid channel name in status")?;
-    let server_envelopes = store::read_channel_all(datadir, &chan)?;
-    let server_ids: HashSet<&str> = server_envelopes.iter().map(|env| env.id.as_str()).collect();
+    let server_inventory = store::message_ids(datadir, &chan)?;
+    let server_ids: HashSet<&str> = server_inventory.iter().map(String::as_str).collect();
     let client_ids: HashSet<&str> = status.ids.iter().map(String::as_str).collect();
 
     let wanted_from_client: Vec<String> = status
@@ -85,9 +85,9 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
         .filter(|id| !server_ids.contains(id.as_str()))
         .cloned()
         .collect();
-    let to_client: Vec<&Envelope> = server_envelopes
+    let to_client: Vec<&String> = server_inventory
         .iter()
-        .filter(|env| !client_ids.contains(env.id.as_str()))
+        .filter(|id| !client_ids.contains(id.as_str()))
         .collect();
 
     let want = WantMessage {
@@ -98,8 +98,9 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
         .await
         .context("send want")?;
 
-    for env in &to_client {
-        ws.send(Message::Text(serde_json::to_string(env)?))
+    for id in &to_client {
+        let env = store::read_message_by_id(datadir, &chan, id)?;
+        ws.send(Message::Text(serde_json::to_string(&env)?))
             .await
             .context("send envelope")?;
     }
@@ -154,8 +155,7 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
     use tokio_tungstenite::connect_async;
 
     let chan = ChannelRef::parse(channel)?;
-    let local_envelopes = store::read_channel_all(datadir, &chan)?;
-    let local_ids: Vec<String> = local_envelopes.iter().map(|env| env.id.clone()).collect();
+    let local_ids = store::message_ids(datadir, &chan)?;
     let status = serde_json::json!({
         "type": "status",
         "version": SYNC_VERSION,
@@ -192,13 +192,10 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
         if let Ok(want) = serde_json::from_str::<WantMessage>(&text)
             && want.msg_type == "want"
         {
-            let wanted: HashSet<&str> = want.ids.iter().map(String::as_str).collect();
-            for env in local_envelopes
-                .iter()
-                .filter(|env| wanted.contains(env.id.as_str()))
-            {
+            for id in &want.ids {
+                let env = store::read_message_by_id(datadir, &chan, id)?;
                 ws.send(tokio_tungstenite::tungstenite::Message::Text(
-                    serde_json::to_string(env)?,
+                    serde_json::to_string(&env)?,
                 ))
                 .await
                 .context("upload wanted envelope")?;

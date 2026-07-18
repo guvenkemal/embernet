@@ -20,7 +20,8 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - Divergence-safe, bidirectional ID-inventory sync ✅
 - MCP interface for AI agents ✅
 - Concurrent append safety and corruption detection ✅
-- next: indexed inventories and Merkle chunks for large-log delta sync.
+- Persistent indexed inventories and message lookups ✅
+- next: Merkle chunks for large-log delta sync.
 - planned: channel ACLs and moderation tools.
 - planned: TUI or Web UI client.
 
