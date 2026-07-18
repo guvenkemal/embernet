@@ -48,6 +48,12 @@ enum Commands {
     /// Show a channel's local write policy
     ChannelPolicy { channel: String },
 
+    /// Show the verified signed policy-event history
+    ChannelPolicyHistory { channel: String },
+
+    /// Rebuild policy.json from the verified signed history
+    ChannelPolicyRebuild { channel: String },
+
     /// Restrict channel writes and make the local identity its owner
     ChannelRestrict { channel: String },
 
@@ -64,6 +70,9 @@ enum Commands {
         role: RoleArg,
         public_key: String,
     },
+
+    /// Transfer channel ownership to an Ed25519 public key
+    ChannelTransferOwner { channel: String, public_key: String },
 
     /// Post a text message into a channel
     Post {
@@ -152,10 +161,24 @@ async fn main() -> Result<()> {
                 serde_json::to_string_pretty(&store::read_channel_policy(&datadir, &chan)?)?
             );
         }
+        Commands::ChannelPolicyHistory { channel } => {
+            let chan = ChannelRef::parse(&channel)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store::read_policy_history(&datadir, &chan)?)?
+            );
+        }
+        Commands::ChannelPolicyRebuild { channel } => {
+            let chan = ChannelRef::parse(&channel)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store::rebuild_policy_cache(&datadir, &chan)?)?
+            );
+        }
         Commands::ChannelRestrict { channel } => {
             let chan = ChannelRef::parse(&channel)?;
             let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
-            let policy = store::restrict_channel(&datadir, &chan, &identity.public_key)?;
+            let policy = store::restrict_channel(&datadir, &chan, &identity)?;
             println!("{}", serde_json::to_string_pretty(&policy)?);
         }
         Commands::ChannelGrant {
@@ -165,13 +188,7 @@ async fn main() -> Result<()> {
         } => {
             let chan = ChannelRef::parse(&channel)?;
             let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
-            let policy = store::grant_role(
-                &datadir,
-                &chan,
-                &identity.public_key,
-                role.into(),
-                &public_key,
-            )?;
+            let policy = store::grant_role(&datadir, &chan, &identity, role.into(), &public_key)?;
             println!("{}", serde_json::to_string_pretty(&policy)?);
         }
         Commands::ChannelRevoke {
@@ -181,13 +198,16 @@ async fn main() -> Result<()> {
         } => {
             let chan = ChannelRef::parse(&channel)?;
             let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
-            let policy = store::revoke_role(
-                &datadir,
-                &chan,
-                &identity.public_key,
-                role.into(),
-                &public_key,
-            )?;
+            let policy = store::revoke_role(&datadir, &chan, &identity, role.into(), &public_key)?;
+            println!("{}", serde_json::to_string_pretty(&policy)?);
+        }
+        Commands::ChannelTransferOwner {
+            channel,
+            public_key,
+        } => {
+            let chan = ChannelRef::parse(&channel)?;
+            let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
+            let policy = store::transfer_ownership(&datadir, &chan, &identity, &public_key)?;
             println!("{}", serde_json::to_string_pretty(&policy)?);
         }
         Commands::Post {

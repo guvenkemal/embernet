@@ -34,12 +34,27 @@ impl KeypairFile {
         let arr: [u8; 64] = bytes.try_into().map_err(|_| anyhow!("bad key bytes"))?;
         Ok(SigningKey::from_keypair_bytes(&arr)?)
     }
+    pub fn sign_bytes(&self, payload: &[u8]) -> Result<String> {
+        Ok(hex::encode(self.signing_key()?.sign(payload).to_bytes()))
+    }
     #[allow(dead_code)]
     pub fn verifying_key(&self) -> Result<VerifyingKey> {
         let pk = hex::decode(&self.public_key)?;
         let arr: [u8; 32] = pk.try_into().map_err(|_| anyhow!("bad pk bytes"))?;
         Ok(VerifyingKey::from_bytes(&arr)?)
     }
+}
+
+pub fn verify_bytes(public_key: &str, signature: &str, payload: &[u8]) -> Result<()> {
+    let pk_bytes: [u8; 32] = hex::decode(public_key)?
+        .try_into()
+        .map_err(|_| anyhow!("bad public key"))?;
+    let sig_bytes: [u8; 64] = hex::decode(signature)?
+        .try_into()
+        .map_err(|_| anyhow!("bad signature"))?;
+    VerifyingKey::from_bytes(&pk_bytes)?
+        .verify(payload, &Signature::from_bytes(&sig_bytes))
+        .map_err(|error| anyhow!("signature verification failed: {error}"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

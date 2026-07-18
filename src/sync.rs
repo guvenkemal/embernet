@@ -431,7 +431,7 @@ mod tests {
             create_channel(dir, &chan).unwrap();
         }
         let owner = KeypairFile::generate(Some("owner".into()));
-        restrict_channel(&server_dir, &chan, &owner.public_key).unwrap();
+        restrict_channel(&server_dir, &chan, &owner).unwrap();
         add_message(&client_dir, &chan, "unauthorized");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

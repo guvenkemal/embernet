@@ -28,4 +28,5 @@ local CLI posts, MCP posts, and synchronized envelopes share one enforcement poi
 - Existing channels remain open until a local operator explicitly restricts them.
 - Policies are local node configuration and are not currently federated.
 - Reads remain public, and policies do not provide confidentiality.
-- Policy changes are not yet represented as signed, append-only audit events.
+- Policy changes were initially mutable local state; [[adr-007-signed-policy-event-chain]]
+  supersedes that aspect with signed, append-only audit events.

@@ -23,7 +23,8 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - Persistent indexed inventories and message lookups ✅
 - ID-prefix Merkle bucket sync v3 ✅
 - Local channel write ACLs ✅
-- next: signed moderation and policy audit events.
+- Signed policy audit events and ownership transfer ✅
+- next: federated policy-history conflict resolution.
 - planned: TUI or Web UI client.
 
 ## Phase 2+ — Ecosystem

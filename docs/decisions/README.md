@@ -14,6 +14,7 @@ Start from [[adr-template]].
 - [[adr-004-rebuildable-message-index]] — Index IDs and record locations while keeping logs authoritative.
 - [[adr-005-prefix-bucket-merkle-sync]] — Reconcile deterministic ID-prefix buckets before messages.
 - [[adr-006-local-channel-write-acls]] — Enforce owner, moderator, and writer roles locally.
+- [[adr-007-signed-policy-event-chain]] — Derive policy from a signed, chained audit log.
 
 ## Suggested ADRs
 

@@ -40,6 +40,12 @@ signed envelope may be appended. A `restricted` policy names one owner and lists
 moderator and writer Ed25519 public keys. All three roles may append; only the owner
 may manage moderators, while the owner and moderators may manage writers.
 
+Policy mutations are stored as channel-bound, Ed25519-signed events in
+`policy.ndjson`. Each event references the previous event ID. Replaying the chain
+verifies every ID, signature, link, and authorization decision; `policy.json` is a
+rebuildable cache. Legacy restricted policies require a signed adoption event from
+their existing owner.
+
 Authorization is checked inside the locked storage append path after envelope
 verification. This applies equally to local CLI posts, MCP posts, and envelopes
 received through sync. Policies are local node configuration: they are not sent by
@@ -250,7 +256,7 @@ so retrying a partially completed sync is safe.
 - Differing inventories are capped at 100,000 IDs per peer and exchange.
 - One channel is reconciled per WebSocket connection.
 - Sync v2 peers are not wire-compatible with v3.
-- Channel policies are local and policy changes are not yet signed audit events.
+- Signed policy histories are local and do not yet have federation fork resolution.
 - `POST /sync` is not implemented in the current code; the active path is WebSocket `GET /sync`.
 
 These limitations should be considered candidates for future ADRs in [[../decisions/README]].
