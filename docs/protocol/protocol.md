@@ -33,6 +33,18 @@ record byte offsets and lengths. The index stores the log length it describes. A
 missing or stale index is rebuilt from the verified log while holding the channel
 lock; `log.ndjson` remains the source of truth.
 
+## Local channel write policy
+
+A channel may contain `policy.json`. If it is absent or has mode `open`, any valid
+signed envelope may be appended. A `restricted` policy names one owner and lists
+moderator and writer Ed25519 public keys. All three roles may append; only the owner
+may manage moderators, while the owner and moderators may manage writers.
+
+Authorization is checked inside the locked storage append path after envelope
+verification. This applies equally to local CLI posts, MCP posts, and envelopes
+received through sync. Policies are local node configuration: they are not sent by
+sync, do not restrict reads, and do not encrypt channel data.
+
 ## Channel names
 
 Channel names are parsed by `ChannelRef::parse` and validated by `valid_channel`.
@@ -238,6 +250,7 @@ so retrying a partially completed sync is safe.
 - Differing inventories are capped at 100,000 IDs per peer and exchange.
 - One channel is reconciled per WebSocket connection.
 - Sync v2 peers are not wire-compatible with v3.
+- Channel policies are local and policy changes are not yet signed audit events.
 - `POST /sync` is not implemented in the current code; the active path is WebSocket `GET /sync`.
 
 These limitations should be considered candidates for future ADRs in [[../decisions/README]].

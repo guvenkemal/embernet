@@ -265,6 +265,7 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
     .context("send status to peer")?;
 
     let mut received = 0_u64;
+    let mut completed = false;
     while let Some(msg) = ws.next().await {
         let msg = msg.context("ws read error")?;
         let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
@@ -273,6 +274,7 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
 
         if let Ok(response) = serde_json::from_str::<SyncResponse>(&text) {
             if response.status == "complete" {
+                completed = true;
                 break;
             }
             if response.status == "error" {
@@ -330,6 +332,9 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
         append_message(datadir, &chan, &env)?;
         received += 1;
     }
+    if !completed {
+        bail!("peer closed before sync completion");
+    }
     Ok(received)
 }
 
@@ -337,7 +342,7 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
 mod tests {
     use super::*;
     use crate::proto::{KeypairFile, Message};
-    use crate::store::{create_channel, init_layout, message_ids};
+    use crate::store::{create_channel, init_layout, message_ids, restrict_channel};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -414,5 +419,30 @@ mod tests {
                 .unwrap();
         retry_task.abort();
         assert_eq!(retry_received, 0);
+    }
+
+    #[tokio::test]
+    async fn restricted_server_rejects_unauthorized_upload() {
+        let server_dir = temp_dir("acl_server");
+        let client_dir = temp_dir("acl_client");
+        let chan = ChannelRef::parse("test/restricted").unwrap();
+        for dir in [&server_dir, &client_dir] {
+            init_layout(dir).unwrap();
+            create_channel(dir, &chan).unwrap();
+        }
+        let owner = KeypairFile::generate(Some("owner".into()));
+        restrict_channel(&server_dir, &chan, &owner.public_key).unwrap();
+        add_message(&client_dir, &chan, "unauthorized");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::server::router(server_dir.clone());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result =
+            sync_from_peer(&client_dir, &format!("ws://{addr}/sync"), &chan.full_name).await;
+        task.abort();
+
+        assert!(result.is_err());
+        assert!(message_ids(&server_dir, &chan).unwrap().is_empty());
     }
 }

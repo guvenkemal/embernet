@@ -57,6 +57,10 @@ Full specification: `docs/protocol/protocol.md`
 embernet keygen           Generate an ed25519 identity keypair
 embernet init             Initialise data directory with a keypair
 embernet channel-create   Create a channel
+embernet channel-policy   Show a channel's local write policy
+embernet channel-restrict Restrict writes and claim ownership with the local identity
+embernet channel-grant    Grant a moderator or writer role
+embernet channel-revoke   Revoke a moderator or writer role
 embernet post             Post a signed text message
 embernet tail             Tail recent messages from a channel
 embernet serve            Run HTTP/WebSocket server (status + sync)
@@ -68,6 +72,7 @@ embernet mcp              Run as an MCP stdio server for AI clients
 
 - Offline-friendly, federated via store-and-forward.
 - Identity is **ed25519 keys** only. No wallets, tokens, or chains.
+- Optional local owner/moderator/writer ACLs gate channel appends.
 - File-backed — no external database required.
 - AI-agent integration via MCP.
 

@@ -25,6 +25,40 @@ pub struct ChunkSummary {
     pub hash: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyMode {
+    Open,
+    Restricted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelPolicy {
+    pub version: u32,
+    pub mode: PolicyMode,
+    pub owner: Option<String>,
+    pub moderators: Vec<String>,
+    pub writers: Vec<String>,
+}
+
+impl Default for ChannelPolicy {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            mode: PolicyMode::Open,
+            owner: None,
+            moderators: Vec::new(),
+            writers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PolicyRole {
+    Moderator,
+    Writer,
+}
+
 #[derive(Debug)]
 struct ScannedEnvelope {
     envelope: Envelope,
@@ -90,6 +124,8 @@ pub fn append_message(base: &Path, chan: &ChannelRef, env: &Envelope) -> Result<
         .with_context(|| format!("open {}", p.display()))?;
     FileExt::lock_exclusive(&file).with_context(|| format!("lock {}", p.display()))?;
 
+    authorize_append(base, chan, &env.from)?;
+
     let db = ensure_index(&mut file, &p)?;
     if index_contains(&db, &env.id)? {
         tracing::debug!("append_message: duplicate id {}, skipping", env.id);
@@ -111,6 +147,141 @@ pub fn append_message(base: &Path, chan: &ChannelRef, env: &Envelope) -> Result<
         file.metadata()?.len(),
     )?;
     Ok(env.id.clone())
+}
+
+fn policy_path(base: &Path, chan: &ChannelRef) -> PathBuf {
+    channel_to_path(base, &chan.full_name).join("policy.json")
+}
+
+fn validate_public_key(key: &str) -> Result<()> {
+    let bytes = hex::decode(key).context("public key must be hexadecimal")?;
+    if bytes.len() != 32 {
+        bail!("public key must encode 32 bytes");
+    }
+    Ok(())
+}
+
+pub fn read_channel_policy(base: &Path, chan: &ChannelRef) -> Result<ChannelPolicy> {
+    let path = policy_path(base, chan);
+    if !path.exists() {
+        return Ok(ChannelPolicy::default());
+    }
+    let policy: ChannelPolicy = serde_json::from_slice(&std::fs::read(&path)?)
+        .with_context(|| format!("invalid channel policy {}", path.display()))?;
+    if policy.version != 1 {
+        bail!("unsupported channel policy version {}", policy.version);
+    }
+    if policy.mode == PolicyMode::Restricted && policy.owner.is_none() {
+        bail!("restricted channel policy has no owner");
+    }
+    if let Some(owner) = &policy.owner {
+        validate_public_key(owner)?;
+    }
+    for key in policy.moderators.iter().chain(&policy.writers) {
+        validate_public_key(key)?;
+    }
+    Ok(policy)
+}
+
+fn authorize_append(base: &Path, chan: &ChannelRef, author: &str) -> Result<()> {
+    let policy = read_channel_policy(base, chan)?;
+    if policy.mode == PolicyMode::Open
+        || policy.owner.as_deref() == Some(author)
+        || policy.moderators.iter().any(|key| key == author)
+        || policy.writers.iter().any(|key| key == author)
+    {
+        return Ok(());
+    }
+    bail!(
+        "author {} is not allowed to write channel {}",
+        author,
+        chan.full_name
+    )
+}
+
+pub fn restrict_channel(base: &Path, chan: &ChannelRef, owner: &str) -> Result<ChannelPolicy> {
+    validate_public_key(owner)?;
+    mutate_policy(base, chan, |policy| {
+        if policy.mode == PolicyMode::Restricted && policy.owner.as_deref() != Some(owner) {
+            bail!("only the current owner can replace a restricted policy");
+        }
+        policy.mode = PolicyMode::Restricted;
+        policy.owner = Some(owner.to_string());
+        Ok(())
+    })
+}
+
+pub fn grant_role(
+    base: &Path,
+    chan: &ChannelRef,
+    actor: &str,
+    role: PolicyRole,
+    public_key: &str,
+) -> Result<ChannelPolicy> {
+    validate_public_key(public_key)?;
+    mutate_policy(base, chan, |policy| {
+        authorize_policy_change(policy, actor, role)?;
+        let members = match role {
+            PolicyRole::Moderator => &mut policy.moderators,
+            PolicyRole::Writer => &mut policy.writers,
+        };
+        if !members.iter().any(|key| key == public_key) {
+            members.push(public_key.to_string());
+            members.sort();
+        }
+        Ok(())
+    })
+}
+
+pub fn revoke_role(
+    base: &Path,
+    chan: &ChannelRef,
+    actor: &str,
+    role: PolicyRole,
+    public_key: &str,
+) -> Result<ChannelPolicy> {
+    mutate_policy(base, chan, |policy| {
+        authorize_policy_change(policy, actor, role)?;
+        let members = match role {
+            PolicyRole::Moderator => &mut policy.moderators,
+            PolicyRole::Writer => &mut policy.writers,
+        };
+        members.retain(|key| key != public_key);
+        Ok(())
+    })
+}
+
+fn authorize_policy_change(policy: &ChannelPolicy, actor: &str, role: PolicyRole) -> Result<()> {
+    if policy.mode != PolicyMode::Restricted {
+        bail!("channel must be restricted before roles can be changed");
+    }
+    let owner = policy.owner.as_deref() == Some(actor);
+    let moderator = policy.moderators.iter().any(|key| key == actor);
+    match role {
+        PolicyRole::Moderator if !owner => bail!("only the owner can manage moderators"),
+        PolicyRole::Writer if !owner && !moderator => {
+            bail!("only the owner or a moderator can manage writers")
+        }
+        _ => Ok(()),
+    }
+}
+
+fn mutate_policy(
+    base: &Path,
+    chan: &ChannelRef,
+    mutation: impl FnOnce(&mut ChannelPolicy) -> Result<()>,
+) -> Result<ChannelPolicy> {
+    let channel_dir = channel_to_path(base, &chan.full_name);
+    let log_path = channel_dir.join("log.ndjson");
+    let log = OpenOptions::new().read(true).open(&log_path)?;
+    FileExt::lock_exclusive(&log).with_context(|| format!("lock {}", log_path.display()))?;
+    let mut policy = read_channel_policy(base, chan)?;
+    mutation(&mut policy)?;
+    let path = policy_path(base, chan);
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, serde_json::to_vec_pretty(&policy)?)?;
+    std::fs::rename(&temp, &path)?;
+    Ok(policy)
 }
 
 fn index_path(log_path: &Path) -> PathBuf {
@@ -800,5 +971,105 @@ mod tests {
         assert!(error.contains(&path.display().to_string()));
         assert!(error.contains("line 1"));
         assert!(error.contains("failed verification"));
+    }
+
+    #[test]
+    fn restricted_policy_enforces_roles_and_revocation() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/private").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let owner = KeypairFile::generate(Some("owner".into()));
+        let writer = KeypairFile::generate(Some("writer".into()));
+        let outsider = KeypairFile::generate(Some("outsider".into()));
+        restrict_channel(&base, &chan, &owner.public_key).unwrap();
+
+        let sign = |key: KeypairFile, body: &str| {
+            Envelope::sign(
+                key,
+                &chan.full_name,
+                Message::new_text(None, vec![], body.into(), vec![]),
+            )
+            .unwrap()
+        };
+        append_message(&base, &chan, &sign(owner.clone(), "owner")).unwrap();
+        assert!(append_message(&base, &chan, &sign(outsider, "denied")).is_err());
+
+        grant_role(
+            &base,
+            &chan,
+            &owner.public_key,
+            PolicyRole::Writer,
+            &writer.public_key,
+        )
+        .unwrap();
+        append_message(&base, &chan, &sign(writer.clone(), "allowed")).unwrap();
+        revoke_role(
+            &base,
+            &chan,
+            &owner.public_key,
+            PolicyRole::Writer,
+            &writer.public_key,
+        )
+        .unwrap();
+        assert!(append_message(&base, &chan, &sign(writer, "revoked")).is_err());
+        assert_eq!(count_messages(&base, &chan).unwrap(), 2);
+    }
+
+    #[test]
+    fn moderator_can_manage_writers_but_not_moderators() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/private").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let owner = KeypairFile::generate(None);
+        let moderator = KeypairFile::generate(None);
+        let writer = KeypairFile::generate(None);
+        restrict_channel(&base, &chan, &owner.public_key).unwrap();
+        grant_role(
+            &base,
+            &chan,
+            &owner.public_key,
+            PolicyRole::Moderator,
+            &moderator.public_key,
+        )
+        .unwrap();
+        grant_role(
+            &base,
+            &chan,
+            &moderator.public_key,
+            PolicyRole::Writer,
+            &writer.public_key,
+        )
+        .unwrap();
+        assert!(
+            grant_role(
+                &base,
+                &chan,
+                &moderator.public_key,
+                PolicyRole::Moderator,
+                &writer.public_key,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_channel_without_policy_remains_open() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/open").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let env = Envelope::sign(
+            KeypairFile::generate(None),
+            &chan.full_name,
+            Message::new_text(None, vec![], "open".into(), vec![]),
+        )
+        .unwrap();
+        append_message(&base, &chan, &env).unwrap();
+        assert_eq!(
+            read_channel_policy(&base, &chan).unwrap().mode,
+            PolicyMode::Open
+        );
     }
 }

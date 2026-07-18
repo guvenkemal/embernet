@@ -22,7 +22,8 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - Concurrent append safety and corruption detection ✅
 - Persistent indexed inventories and message lookups ✅
 - ID-prefix Merkle bucket sync v3 ✅
-- next: channel ACLs and moderation tools.
+- Local channel write ACLs ✅
+- next: signed moderation and policy audit events.
 - planned: TUI or Web UI client.
 
 ## Phase 2+ — Ecosystem

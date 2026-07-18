@@ -16,6 +16,7 @@ This folder contains high-level system diagrams, flow notes, and architectural s
 local CLI post
   -> Message
   -> Envelope::sign(...)
+  -> policy.json write authorization
   -> locked channels/<channel>/log.ndjson append
   -> transactional channels/<channel>/index.redb update
 
