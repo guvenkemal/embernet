@@ -12,6 +12,7 @@ Start from [[adr-template]].
 - [[adr-002-id-inventory-sync]] — Reconcile divergent peers by message-ID inventory.
 - [[adr-003-locked-durable-channel-appends]] — Serialize durable channel writes and detect corruption.
 - [[adr-004-rebuildable-message-index]] — Index IDs and record locations while keeping logs authoritative.
+- [[adr-005-prefix-bucket-merkle-sync]] — Reconcile deterministic ID-prefix buckets before messages.
 
 ## Suggested ADRs
 

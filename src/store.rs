@@ -3,13 +3,27 @@ use crate::util::{channel_to_path, ensure_dir, valid_channel};
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("messages");
 const INDEX_META: TableDefinition<&str, u64> = TableDefinition::new("metadata");
+const INDEX_CHUNKS: TableDefinition<u64, &[u8]> = TableDefinition::new("chunk_members");
+const INDEX_CHUNK_HASHES: TableDefinition<u64, &[u8]> = TableDefinition::new("chunk_hashes");
 const INDEX_LOG_LEN: &str = "log_len";
+const INDEX_MESSAGE_COUNT: &str = "message_count";
+const INDEX_SCHEMA: &str = "schema";
+const INDEX_SCHEMA_VERSION: u64 = 2;
+pub const MERKLE_BUCKET_COUNT: usize = 256;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChunkSummary {
+    pub index: u64,
+    pub count: u64,
+    pub hash: String,
+}
 
 #[derive(Debug)]
 struct ScannedEnvelope {
@@ -123,14 +137,17 @@ fn ensure_index(log: &mut std::fs::File, log_path: &Path) -> Result<Database> {
     let path = index_path(log_path);
     let log_len = log.metadata()?.len();
     let db = Database::create(&path).with_context(|| format!("open {}", path.display()))?;
-    let current_len = {
+    let current = {
         let read = db.begin_read()?;
         match read.open_table(INDEX_META) {
-            Ok(table) => table.get(INDEX_LOG_LEN)?.map(|value| value.value()),
-            Err(_) => None,
+            Ok(table) => (
+                table.get(INDEX_LOG_LEN)?.map(|value| value.value()),
+                table.get(INDEX_SCHEMA)?.map(|value| value.value()),
+            ),
+            Err(_) => (None, None),
         }
     };
-    if current_len != Some(log_len) {
+    if current != (Some(log_len), Some(INDEX_SCHEMA_VERSION)) {
         rebuild_index(&db, log, log_path, log_len)?;
     }
     Ok(db)
@@ -144,9 +161,16 @@ fn rebuild_index(
 ) -> Result<()> {
     log.seek(SeekFrom::Start(0))?;
     let scanned = scan_verified_file(log, log_path)?;
+    let message_count = scanned.len() as u64;
+    let ids: Vec<String> = scanned
+        .iter()
+        .map(|item| item.envelope.id.clone())
+        .collect();
     let write = db.begin_write()?;
     let _ = write.delete_table(INDEX);
     let _ = write.delete_table(INDEX_META);
+    let _ = write.delete_table(INDEX_CHUNKS);
+    let _ = write.delete_table(INDEX_CHUNK_HASHES);
     {
         let mut index = write.open_table(INDEX)?;
         for item in scanned {
@@ -155,8 +179,29 @@ fn rebuild_index(
         }
     }
     {
+        let mut chunks = write.open_table(INDEX_CHUNKS)?;
+        let mut hashes = write.open_table(INDEX_CHUNK_HASHES)?;
+        let mut buckets = vec![Vec::new(); MERKLE_BUCKET_COUNT];
+        for id in ids {
+            let bytes = hex::decode(id)?;
+            buckets[bytes[0] as usize].push(bytes);
+        }
+        for (index, mut ids) in buckets.into_iter().enumerate() {
+            if ids.is_empty() {
+                continue;
+            }
+            ids.sort();
+            let members: Vec<u8> = ids.into_iter().flatten().collect();
+            let hash = blake3::hash(&members);
+            chunks.insert(index as u64, members.as_slice())?;
+            hashes.insert(index as u64, hash.as_bytes().as_slice())?;
+        }
+    }
+    {
         let mut meta = write.open_table(INDEX_META)?;
         meta.insert(INDEX_LOG_LEN, log_len)?;
+        meta.insert(INDEX_MESSAGE_COUNT, message_count)?;
+        meta.insert(INDEX_SCHEMA, INDEX_SCHEMA_VERSION)?;
     }
     write.commit()?;
     Ok(())
@@ -171,13 +216,44 @@ fn index_contains(db: &Database, id: &str) -> Result<bool> {
 fn index_insert(db: &Database, id: &str, offset: u64, length: u64, log_len: u64) -> Result<()> {
     let location = encode_location(offset, length);
     let write = db.begin_write()?;
+    let message_count = {
+        let meta = write.open_table(INDEX_META)?;
+        meta.get(INDEX_MESSAGE_COUNT)?
+            .map_or(0, |value| value.value())
+    };
+    let id_bytes = hex::decode(id)?;
+    if id_bytes.len() != 32 {
+        bail!("invalid message id length in index");
+    }
+    let chunk_index = id_bytes[0] as u64;
+    let mut members = {
+        let chunks = write.open_table(INDEX_CHUNKS)?;
+        chunks
+            .get(chunk_index)?
+            .map_or_else(Vec::new, |value| value.value().to_vec())
+    };
+    members.extend_from_slice(&id_bytes);
+    let mut ids: Vec<Vec<u8>> = members.chunks_exact(32).map(<[u8]>::to_vec).collect();
+    ids.sort();
+    members = ids.into_iter().flatten().collect();
+    let chunk_hash = blake3::hash(&members);
     {
         let mut index = write.open_table(INDEX)?;
         index.insert(id, location.as_slice())?;
     }
     {
+        let mut chunks = write.open_table(INDEX_CHUNKS)?;
+        chunks.insert(chunk_index, members.as_slice())?;
+    }
+    {
+        let mut hashes = write.open_table(INDEX_CHUNK_HASHES)?;
+        hashes.insert(chunk_index, chunk_hash.as_bytes().as_slice())?;
+    }
+    {
         let mut meta = write.open_table(INDEX_META)?;
         meta.insert(INDEX_LOG_LEN, log_len)?;
+        meta.insert(INDEX_MESSAGE_COUNT, message_count + 1)?;
+        meta.insert(INDEX_SCHEMA, INDEX_SCHEMA_VERSION)?;
     }
     write.commit()?;
     Ok(())
@@ -292,6 +368,7 @@ pub fn read_channel_all(base: &Path, chan: &ChannelRef) -> Result<Vec<Envelope>>
 }
 
 /// Return the ordered message-id inventory for a channel.
+#[cfg(test)]
 pub fn message_ids(base: &Path, chan: &ChannelRef) -> Result<Vec<String>> {
     let log_path = channel_to_path(base, &chan.full_name).join("log.ndjson");
     let mut log = OpenOptions::new().read(true).open(&log_path)?;
@@ -307,6 +384,47 @@ pub fn message_ids(base: &Path, chan: &ChannelRef) -> Result<Vec<String>> {
     }
     entries.sort_by_key(|(offset, _)| *offset);
     Ok(entries.into_iter().map(|(_, id)| id).collect())
+}
+
+pub fn chunk_summaries(base: &Path, chan: &ChannelRef) -> Result<Vec<ChunkSummary>> {
+    let log_path = channel_to_path(base, &chan.full_name).join("log.ndjson");
+    let mut log = OpenOptions::new().read(true).open(&log_path)?;
+    FileExt::lock_exclusive(&log).with_context(|| format!("lock {}", log_path.display()))?;
+    let db = ensure_index(&mut log, &log_path)?;
+    let read = db.begin_read()?;
+    let chunks = read.open_table(INDEX_CHUNKS)?;
+    let hashes = read.open_table(INDEX_CHUNK_HASHES)?;
+    let mut summaries = Vec::new();
+    for entry in chunks.iter()? {
+        let (index, members) = entry?;
+        let index = index.value();
+        let members = members.value();
+        let hash = hashes
+            .get(index)?
+            .context("chunk hash missing from index")?;
+        summaries.push(ChunkSummary {
+            index,
+            count: (members.len() / 32) as u64,
+            hash: hex::encode(hash.value()),
+        });
+    }
+    Ok(summaries)
+}
+
+pub fn chunk_ids(base: &Path, chan: &ChannelRef, chunk_index: u64) -> Result<Vec<String>> {
+    let log_path = channel_to_path(base, &chan.full_name).join("log.ndjson");
+    let mut log = OpenOptions::new().read(true).open(&log_path)?;
+    FileExt::lock_exclusive(&log).with_context(|| format!("lock {}", log_path.display()))?;
+    let db = ensure_index(&mut log, &log_path)?;
+    let read = db.begin_read()?;
+    let chunks = read.open_table(INDEX_CHUNKS)?;
+    let Some(members) = chunks.get(chunk_index)? else {
+        return Ok(Vec::new());
+    };
+    if members.value().len() % 32 != 0 {
+        bail!("invalid chunk {chunk_index} membership length");
+    }
+    Ok(members.value().chunks_exact(32).map(hex::encode).collect())
 }
 
 /// Read and verify one envelope using its indexed byte range.
@@ -507,6 +625,39 @@ mod tests {
         assert_eq!(
             message_ids(&base, &chan).unwrap(),
             vec![first.id, second.id]
+        );
+    }
+
+    #[test]
+    fn chunk_hashes_ignore_arrival_order() {
+        let first_base = temp_dir();
+        let second_base = temp_dir();
+        let chan = ChannelRef::parse("test/chunks").unwrap();
+        for base in [&first_base, &second_base] {
+            init_layout(base).unwrap();
+            create_channel(base, &chan).unwrap();
+        }
+        let key = KeypairFile::generate(Some("tester".into()));
+        let first = Envelope::sign(
+            key.clone(),
+            &chan.full_name,
+            Message::new_text(None, vec![], "first".into(), vec![]),
+        )
+        .unwrap();
+        let second = Envelope::sign(
+            key,
+            &chan.full_name,
+            Message::new_text(None, vec![], "second".into(), vec![]),
+        )
+        .unwrap();
+        append_message(&first_base, &chan, &first).unwrap();
+        append_message(&first_base, &chan, &second).unwrap();
+        append_message(&second_base, &chan, &second).unwrap();
+        append_message(&second_base, &chan, &first).unwrap();
+
+        assert_eq!(
+            chunk_summaries(&first_base, &chan).unwrap(),
+            chunk_summaries(&second_base, &chan).unwrap()
         );
     }
 

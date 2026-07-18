@@ -174,17 +174,18 @@ The current sync protocol is implemented over WebSocket at:
 GET /sync
 ```
 
-Sync v2 reconciles one channel per connection. The initiating peer sends its complete
-message-ID inventory after the WebSocket opens.
+Sync v3 reconciles one channel per connection. IDs are grouped by their first byte
+into 256 buckets. Each bucket hash is BLAKE3 over its lexicographically sorted raw
+32-byte IDs. The initiating peer sends compact summaries after the socket opens.
 
 ### Client status packet
 
 ```json
 {
   "type": "status",
-  "version": 2,
+  "version": 3,
   "channel": "tech/linux",
-  "ids": ["4f...", "a2..."]
+  "chunks": [{"index": 79, "count": 12, "hash": "a2..."}]
 }
 ```
 
@@ -193,14 +194,15 @@ Fields:
 | Field | Type | Description |
 | --- | --- | --- |
 | `type` | string | Must be `"status"`. |
-| `version` | integer | Must be `2`. |
+| `version` | integer | Must be `3`. |
 | `channel` | string | Channel to synchronize. |
-| `ids` | array | Ordered IDs of every local envelope in the channel. |
+| `chunks` | array | Non-empty bucket summaries: prefix index, ID count, and hash. |
 
 ### Server behavior
 
-The server validates the channel and version, reads its verified local inventory,
-and requests IDs that exist only on the client:
+The server returns its IDs only for differing buckets and requests the corresponding
+client buckets. The client answers with a `chunk_ids` frame. After comparing those
+limited inventories, the server requests IDs that exist only on the client:
 
 ```json
 {
@@ -232,9 +234,10 @@ so retrying a partially completed sync is safe.
 
 ## Current limitations
 
-- Inventories are linear in channel size and capped at 100,000 IDs per exchange.
+- A differing prefix bucket exchanges its complete ID list.
+- Differing inventories are capped at 100,000 IDs per peer and exchange.
 - One channel is reconciled per WebSocket connection.
-- Full ID inventories are still enumerated for every sync exchange.
+- Sync v2 peers are not wire-compatible with v3.
 - `POST /sync` is not implemented in the current code; the active path is WebSocket `GET /sync`.
 
 These limitations should be considered candidates for future ADRs in [[../decisions/README]].

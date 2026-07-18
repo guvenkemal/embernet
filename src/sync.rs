@@ -11,8 +11,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-const SYNC_VERSION: u32 = 2;
-const MAX_INVENTORY_IDS: usize = 100_000;
+const SYNC_VERSION: u32 = 3;
+const MAX_DIFFERING_IDS: usize = 100_000;
 
 #[derive(Debug, Deserialize)]
 struct StatusMessage {
@@ -20,7 +20,28 @@ struct StatusMessage {
     msg_type: String,
     version: u32,
     channel: String,
+    chunks: Vec<store::ChunkSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChunkIds {
+    index: u64,
     ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChunkDiff {
+    #[serde(rename = "type")]
+    msg_type: String,
+    chunks: Vec<ChunkIds>,
+    want_chunks: Vec<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChunkBatch {
+    #[serde(rename = "type")]
+    msg_type: String,
+    chunks: Vec<ChunkIds>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,24 +92,81 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
     if status.version != SYNC_VERSION {
         bail!("unsupported sync version: {}", status.version);
     }
-    if status.ids.len() > MAX_INVENTORY_IDS {
-        bail!("inventory exceeds {MAX_INVENTORY_IDS} ids");
+    if status.chunks.len() > store::MERKLE_BUCKET_COUNT
+        || status
+            .chunks
+            .iter()
+            .any(|chunk| chunk.index >= store::MERKLE_BUCKET_COUNT as u64)
+    {
+        bail!("invalid chunk summary inventory");
     }
     let chan = ChannelRef::parse(&status.channel).context("invalid channel name in status")?;
-    let server_inventory = store::message_ids(datadir, &chan)?;
-    let server_ids: HashSet<&str> = server_inventory.iter().map(String::as_str).collect();
-    let client_ids: HashSet<&str> = status.ids.iter().map(String::as_str).collect();
+    let server_summaries = store::chunk_summaries(datadir, &chan)?;
+    let client_hashes: std::collections::HashMap<u64, &str> = status
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.index, chunk.hash.as_str()))
+        .collect();
+    if client_hashes.len() != status.chunks.len()
+        || status.chunks.iter().any(|chunk| {
+            hex::decode(&chunk.hash)
+                .map(|hash| hash.len() != 32)
+                .unwrap_or(true)
+        })
+    {
+        bail!("invalid chunk summary");
+    }
+    let server_hashes: std::collections::HashMap<u64, &str> = server_summaries
+        .iter()
+        .map(|chunk| (chunk.index, chunk.hash.as_str()))
+        .collect();
+    let mut differing: Vec<u64> = server_hashes
+        .keys()
+        .chain(client_hashes.keys())
+        .copied()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .filter(|index| server_hashes.get(index) != client_hashes.get(index))
+        .collect();
+    differing.sort_unstable();
+    let server_chunks: Vec<ChunkIds> = differing
+        .iter()
+        .map(|index| {
+            Ok(ChunkIds {
+                index: *index,
+                ids: store::chunk_ids(datadir, &chan, *index)?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    let expected_chunks: HashSet<u64> = differing.iter().copied().collect();
+    ws.send(Message::Text(serde_json::to_string(&ChunkDiff {
+        msg_type: "chunk_diff".into(),
+        chunks: server_chunks.clone(),
+        want_chunks: differing,
+    })?))
+    .await
+    .context("send chunk diff")?;
 
-    let wanted_from_client: Vec<String> = status
-        .ids
-        .iter()
-        .filter(|id| !server_ids.contains(id.as_str()))
-        .cloned()
-        .collect();
-    let to_client: Vec<&String> = server_inventory
-        .iter()
-        .filter(|id| !client_ids.contains(id.as_str()))
-        .collect();
+    let batch = read_chunk_batch(&mut ws).await?;
+    let returned_chunks: HashSet<u64> = batch.chunks.iter().map(|chunk| chunk.index).collect();
+    if returned_chunks != expected_chunks || returned_chunks.len() != batch.chunks.len() {
+        bail!("peer returned unexpected chunk inventory");
+    }
+    for chunk in &batch.chunks {
+        for id in &chunk.ids {
+            let bytes = hex::decode(id).context("invalid message id in chunk inventory")?;
+            if bytes.len() != 32 || bytes[0] as u64 != chunk.index {
+                bail!("message id does not belong to chunk {}", chunk.index);
+            }
+        }
+    }
+    let client_ids: HashSet<String> = batch.chunks.into_iter().flat_map(|c| c.ids).collect();
+    let server_ids: HashSet<String> = server_chunks.into_iter().flat_map(|c| c.ids).collect();
+    if client_ids.len() > MAX_DIFFERING_IDS || server_ids.len() > MAX_DIFFERING_IDS {
+        bail!("differing inventory exceeds {MAX_DIFFERING_IDS} ids");
+    }
+    let wanted_from_client: Vec<String> = client_ids.difference(&server_ids).cloned().collect();
+    let to_client: Vec<String> = server_ids.difference(&client_ids).cloned().collect();
 
     let want = WantMessage {
         msg_type: "want".into(),
@@ -151,16 +229,32 @@ async fn read_status(ws: &mut WebSocket) -> Result<StatusMessage> {
     Ok(status)
 }
 
+async fn read_chunk_batch(ws: &mut WebSocket) -> Result<ChunkBatch> {
+    loop {
+        let msg = ws
+            .next()
+            .await
+            .context("peer closed before chunk inventory")??;
+        if let Message::Text(text) = msg {
+            let batch: ChunkBatch = serde_json::from_str(&text).context("invalid chunk batch")?;
+            if batch.msg_type != "chunk_ids" {
+                bail!("expected type=chunk_ids");
+            }
+            return Ok(batch);
+        }
+    }
+}
+
 pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Result<u64> {
     use tokio_tungstenite::connect_async;
 
     let chan = ChannelRef::parse(channel)?;
-    let local_ids = store::message_ids(datadir, &chan)?;
+    let local_chunks = store::chunk_summaries(datadir, &chan)?;
     let status = serde_json::json!({
         "type": "status",
         "version": SYNC_VERSION,
         "channel": channel,
-        "ids": local_ids,
+        "chunks": local_chunks,
     });
 
     let (mut ws, _) = connect_async(peer_url).await.context("connect to peer")?;
@@ -187,6 +281,30 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
                     response.error.as_deref().unwrap_or("unknown")
                 );
             }
+        }
+
+        if let Ok(diff) = serde_json::from_str::<ChunkDiff>(&text)
+            && diff.msg_type == "chunk_diff"
+        {
+            let chunks = diff
+                .want_chunks
+                .into_iter()
+                .map(|index| {
+                    Ok(ChunkIds {
+                        index,
+                        ids: store::chunk_ids(datadir, &chan, index)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&ChunkBatch {
+                    msg_type: "chunk_ids".into(),
+                    chunks,
+                })?,
+            ))
+            .await
+            .context("send chunk ids")?;
+            continue;
         }
 
         if let Ok(want) = serde_json::from_str::<WantMessage>(&text)
@@ -280,6 +398,10 @@ mod tests {
                 .into_iter()
                 .collect::<HashSet<_>>(),
             expected
+        );
+        assert_eq!(
+            store::chunk_summaries(&server_dir, &chan).unwrap(),
+            store::chunk_summaries(&client_dir, &chan).unwrap()
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

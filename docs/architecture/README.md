@@ -21,7 +21,8 @@ local CLI post
 
 remote sync
   -> WebSocket /sync
-  -> client status packet { version, channel, ids }
+  -> client status packet { version, channel, chunks }
+  -> peers expand only differing ID-prefix buckets
   -> server requests client-only ids
   -> peers exchange missing Envelope objects in both directions
   -> each peer Envelope::verify() + deduplicated append

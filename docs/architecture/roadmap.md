@@ -21,8 +21,8 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - MCP interface for AI agents ✅
 - Concurrent append safety and corruption detection ✅
 - Persistent indexed inventories and message lookups ✅
-- next: Merkle chunks for large-log delta sync.
-- planned: channel ACLs and moderation tools.
+- ID-prefix Merkle bucket sync v3 ✅
+- next: channel ACLs and moderation tools.
 - planned: TUI or Web UI client.
 
 ## Phase 2+ — Ecosystem
@@ -44,6 +44,8 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 
 ## Current status
 
-Phase 1 is active. Sync v2 reconciles divergent peers by message ID in both directions, and the MCP interface lets AI agents read and write coordination logs.
+Phase 1 is active. Sync v3 uses deterministic Merkle buckets to localize divergent
+message IDs before bidirectional transfer, and the MCP interface lets AI agents read
+and write coordination logs.
 
 Related: [[../decisions/adr-001-log-storage]], [[../decisions/adr-template]]
