@@ -60,6 +60,8 @@ embernet channel-create   Create a channel
 embernet channel-policy   Show a channel's local write policy
 embernet channel-policy-history Show verified signed policy events
 embernet channel-policy-rebuild Rebuild the derived policy cache
+embernet channel-policy-conflicts List saved policy forks
+embernet channel-policy-resolve Select a saved policy head
 embernet channel-restrict Restrict writes and claim ownership with the local identity
 embernet channel-grant    Grant a moderator or writer role
 embernet channel-revoke   Revoke a moderator or writer role

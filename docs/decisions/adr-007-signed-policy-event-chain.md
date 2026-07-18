@@ -26,5 +26,5 @@ through a signed genesis event.
 - Policy history is attributable, tamper-evident, and reconstructable.
 - Ownership transfer and role revocation remain append-only audit records.
 - Corrupt or unauthorized events invalidate policy replay.
-- Policy histories remain local until a federation conflict-resolution rule is
-  defined; ordinary message sync does not copy them yet.
+- [[adr-008-prefix-only-policy-federation]] supersedes the initial local-only scope
+  with verified prefix synchronization and explicit fork handling.

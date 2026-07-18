@@ -11,8 +11,9 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-const SYNC_VERSION: u32 = 3;
+const SYNC_VERSION: u32 = 4;
 const MAX_DIFFERING_IDS: usize = 100_000;
+const MAX_POLICY_EVENTS: usize = 10_000;
 
 #[derive(Debug, Deserialize)]
 struct StatusMessage {
@@ -20,7 +21,16 @@ struct StatusMessage {
     msg_type: String,
     version: u32,
     channel: String,
+    policy_events: Vec<store::PolicyEvent>,
     chunks: Vec<store::ChunkSummary>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PolicySync {
+    #[serde(rename = "type")]
+    msg_type: String,
+    status: String,
+    events: Vec<store::PolicyEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +102,9 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
     if status.version != SYNC_VERSION {
         bail!("unsupported sync version: {}", status.version);
     }
+    if status.policy_events.len() > MAX_POLICY_EVENTS {
+        bail!("policy history exceeds {MAX_POLICY_EVENTS} events");
+    }
     if status.chunks.len() > store::MERKLE_BUCKET_COUNT
         || status
             .chunks
@@ -101,6 +114,31 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
         bail!("invalid chunk summary inventory");
     }
     let chan = ChannelRef::parse(&status.channel).context("invalid channel name in status")?;
+    store::validate_policy_history(&chan, &status.policy_events)?;
+    let local_policy = store::read_policy_history(datadir, &chan)?;
+    let local_prefix = is_policy_prefix(&local_policy, &status.policy_events);
+    let remote_prefix = is_policy_prefix(&status.policy_events, &local_policy);
+    if !local_prefix && !remote_prefix {
+        store::save_policy_conflict(datadir, &chan, &status.policy_events)?;
+        ws.send(Message::Text(serde_json::to_string(&PolicySync {
+            msg_type: "policy_sync".into(),
+            status: "conflict".into(),
+            events: local_policy,
+        })?))
+        .await?;
+        bail!("policy history fork");
+    }
+    if local_prefix && status.policy_events.len() > local_policy.len() {
+        store::append_remote_policy_history(datadir, &chan, &status.policy_events)?;
+    }
+    let reconciled_policy = store::read_policy_history(datadir, &chan)?;
+    ws.send(Message::Text(serde_json::to_string(&PolicySync {
+        msg_type: "policy_sync".into(),
+        status: "update".into(),
+        events: reconciled_policy,
+    })?))
+    .await
+    .context("send policy sync")?;
     let server_summaries = store::chunk_summaries(datadir, &chan)?;
     let client_hashes: std::collections::HashMap<u64, &str> = status
         .chunks
@@ -213,6 +251,14 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn is_policy_prefix(prefix: &[store::PolicyEvent], history: &[store::PolicyEvent]) -> bool {
+    prefix.len() <= history.len()
+        && prefix
+            .iter()
+            .zip(history)
+            .all(|(left, right)| left.id == right.id)
+}
+
 async fn read_status(ws: &mut WebSocket) -> Result<StatusMessage> {
     let msg = ws
         .next()
@@ -250,10 +296,12 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
 
     let chan = ChannelRef::parse(channel)?;
     let local_chunks = store::chunk_summaries(datadir, &chan)?;
+    let policy_events = store::read_policy_history(datadir, &chan)?;
     let status = serde_json::json!({
         "type": "status",
         "version": SYNC_VERSION,
         "channel": channel,
+        "policy_events": policy_events,
         "chunks": local_chunks,
     });
 
@@ -283,6 +331,20 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
                     response.error.as_deref().unwrap_or("unknown")
                 );
             }
+        }
+
+        if let Ok(policy) = serde_json::from_str::<PolicySync>(&text)
+            && policy.msg_type == "policy_sync"
+        {
+            if policy.status == "conflict" {
+                store::save_policy_conflict(datadir, &chan, &policy.events)?;
+                bail!("policy history fork");
+            }
+            if policy.status != "update" {
+                bail!("unexpected policy sync status {}", policy.status);
+            }
+            store::append_remote_policy_history(datadir, &chan, &policy.events)?;
+            continue;
         }
 
         if let Ok(diff) = serde_json::from_str::<ChunkDiff>(&text)
@@ -342,7 +404,11 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
 mod tests {
     use super::*;
     use crate::proto::{KeypairFile, Message};
-    use crate::store::{create_channel, init_layout, message_ids, restrict_channel};
+    use crate::store::{
+        PolicyRole, create_channel, grant_role, init_layout, list_policy_conflicts, message_ids,
+        read_policy_history, restrict_channel,
+    };
+    use crate::util::channel_to_path;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -444,5 +510,90 @@ mod tests {
 
         assert!(result.is_err());
         assert!(message_ids(&server_dir, &chan).unwrap().is_empty());
+    }
+
+    fn copy_policy_history(from: &Path, to: &Path, chan: &ChannelRef) {
+        let source = channel_to_path(from, &chan.full_name).join("policy.ndjson");
+        let target = channel_to_path(to, &chan.full_name).join("policy.ndjson");
+        std::fs::copy(source, target).unwrap();
+    }
+
+    async fn sync_once(server_dir: &Path, client_dir: &Path, chan: &ChannelRef) -> Result<u64> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let app = crate::server::router(server_dir.to_path_buf());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result =
+            sync_from_peer(client_dir, &format!("ws://{addr}/sync"), &chan.full_name).await;
+        task.abort();
+        result
+    }
+
+    #[tokio::test]
+    async fn policy_prefixes_sync_in_both_directions() {
+        let server_dir = temp_dir("policy_server");
+        let client_dir = temp_dir("policy_client");
+        let chan = ChannelRef::parse("test/policy-sync").unwrap();
+        for dir in [&server_dir, &client_dir] {
+            init_layout(dir).unwrap();
+            create_channel(dir, &chan).unwrap();
+        }
+        let owner = KeypairFile::generate(None);
+        let first_writer = KeypairFile::generate(None);
+        let second_writer = KeypairFile::generate(None);
+        restrict_channel(&server_dir, &chan, &owner).unwrap();
+        copy_policy_history(&server_dir, &client_dir, &chan);
+
+        grant_role(
+            &server_dir,
+            &chan,
+            &owner,
+            PolicyRole::Writer,
+            &first_writer.public_key,
+        )
+        .unwrap();
+        sync_once(&server_dir, &client_dir, &chan).await.unwrap();
+        assert_eq!(
+            read_policy_history(&server_dir, &chan).unwrap(),
+            read_policy_history(&client_dir, &chan).unwrap()
+        );
+
+        grant_role(
+            &client_dir,
+            &chan,
+            &owner,
+            PolicyRole::Writer,
+            &second_writer.public_key,
+        )
+        .unwrap();
+        sync_once(&server_dir, &client_dir, &chan).await.unwrap();
+        assert_eq!(
+            read_policy_history(&server_dir, &chan).unwrap(),
+            read_policy_history(&client_dir, &chan).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_fork_is_saved_and_blocks_message_sync() {
+        let server_dir = temp_dir("fork_server");
+        let client_dir = temp_dir("fork_client");
+        let chan = ChannelRef::parse("test/policy-fork").unwrap();
+        for dir in [&server_dir, &client_dir] {
+            init_layout(dir).unwrap();
+            create_channel(dir, &chan).unwrap();
+        }
+        let owner = KeypairFile::generate(None);
+        restrict_channel(&server_dir, &chan, &owner).unwrap();
+        copy_policy_history(&server_dir, &client_dir, &chan);
+        for (dir, writer) in [
+            (&server_dir, KeypairFile::generate(None)),
+            (&client_dir, KeypairFile::generate(None)),
+        ] {
+            grant_role(dir, &chan, &owner, PolicyRole::Writer, &writer.public_key).unwrap();
+        }
+
+        assert!(sync_once(&server_dir, &client_dir, &chan).await.is_err());
+        assert_eq!(list_policy_conflicts(&server_dir, &chan).unwrap().len(), 1);
+        assert_eq!(list_policy_conflicts(&client_dir, &chan).unwrap().len(), 1);
     }
 }

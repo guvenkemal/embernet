@@ -521,6 +521,130 @@ pub fn rebuild_policy_cache(base: &Path, chan: &ChannelRef) -> Result<ChannelPol
     Ok(policy)
 }
 
+pub fn validate_policy_history(chan: &ChannelRef, events: &[PolicyEvent]) -> Result<ChannelPolicy> {
+    derive_policy(chan, events)
+}
+
+pub fn append_remote_policy_history(
+    base: &Path,
+    chan: &ChannelRef,
+    remote: &[PolicyEvent],
+) -> Result<ChannelPolicy> {
+    let channel_dir = channel_to_path(base, &chan.full_name);
+    let log_path = channel_dir.join("log.ndjson");
+    let log = OpenOptions::new().read(true).open(&log_path)?;
+    FileExt::lock_exclusive(&log).with_context(|| format!("lock {}", log_path.display()))?;
+    let local = read_policy_history(base, chan)?;
+    validate_policy_history(chan, remote)?;
+    if local.len() > remote.len()
+        || !local
+            .iter()
+            .zip(remote)
+            .all(|(left, right)| left.id == right.id)
+    {
+        bail!("remote policy history does not extend the local history");
+    }
+    if remote.len() > local.len() {
+        let path = policy_log_path(base, chan);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        for event in &remote[local.len()..] {
+            serde_json::to_writer(&mut file, event)?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        file.sync_data()?;
+    }
+    let policy = derive_policy(chan, remote)?;
+    write_policy_cache(base, chan, &policy)?;
+    Ok(policy)
+}
+
+fn policy_conflict_dir(base: &Path, chan: &ChannelRef) -> PathBuf {
+    channel_to_path(base, &chan.full_name).join("policy-conflicts")
+}
+
+pub fn save_policy_conflict(
+    base: &Path,
+    chan: &ChannelRef,
+    events: &[PolicyEvent],
+) -> Result<String> {
+    validate_policy_history(chan, events)?;
+    let head = events
+        .last()
+        .context("cannot save an empty policy conflict")?
+        .id
+        .clone();
+    let dir = policy_conflict_dir(base, chan);
+    ensure_dir(&dir)?;
+    let path = dir.join(format!("{head}.ndjson"));
+    let mut bytes = Vec::new();
+    for event in events {
+        serde_json::to_writer(&mut bytes, event)?;
+        bytes.push(b'\n');
+    }
+    std::fs::write(path, bytes)?;
+    Ok(head)
+}
+
+pub fn list_policy_conflicts(base: &Path, chan: &ChannelRef) -> Result<Vec<String>> {
+    let dir = policy_conflict_dir(base, chan);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut heads = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && let Some(name) = entry.path().file_stem().and_then(|name| name.to_str())
+        {
+            heads.push(name.to_string());
+        }
+    }
+    heads.sort();
+    Ok(heads)
+}
+
+pub fn resolve_policy_conflict(
+    base: &Path,
+    chan: &ChannelRef,
+    head: &str,
+) -> Result<ChannelPolicy> {
+    validate_public_key(head).context("policy head must be a 32-byte hex ID")?;
+    let path = policy_conflict_dir(base, chan).join(format!("{head}.ndjson"));
+    let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    let events: Vec<PolicyEvent> = String::from_utf8(bytes)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<_, _>>()?;
+    if events.last().map(|event| event.id.as_str()) != Some(head) {
+        bail!("saved policy conflict does not match requested head");
+    }
+    let policy = validate_policy_history(chan, &events)?;
+    let log_path = channel_to_path(base, &chan.full_name).join("log.ndjson");
+    let log = OpenOptions::new().read(true).open(&log_path)?;
+    FileExt::lock_exclusive(&log).with_context(|| format!("lock {}", log_path.display()))?;
+    let history_path = policy_log_path(base, chan);
+    let temp = history_path.with_extension("ndjson.tmp");
+    let mut data = Vec::new();
+    for event in &events {
+        serde_json::to_writer(&mut data, event)?;
+        data.push(b'\n');
+    }
+    std::fs::write(&temp, data)?;
+    std::fs::rename(temp, history_path)?;
+    write_policy_cache(base, chan, &policy)?;
+    Ok(policy)
+}
+
+fn write_policy_cache(base: &Path, chan: &ChannelRef, policy: &ChannelPolicy) -> Result<()> {
+    let path = policy_path(base, chan);
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, serde_json::to_vec_pretty(policy)?)?;
+    std::fs::rename(temp, path)?;
+    Ok(())
+}
+
 fn index_path(log_path: &Path) -> PathBuf {
     log_path.with_file_name("index.redb")
 }

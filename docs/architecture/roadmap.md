@@ -24,7 +24,8 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - ID-prefix Merkle bucket sync v3 ✅
 - Local channel write ACLs ✅
 - Signed policy audit events and ownership transfer ✅
-- next: federated policy-history conflict resolution.
+- Prefix-only policy federation and explicit fork handling ✅
+- next: signed moderation events and filtered views.
 - planned: TUI or Web UI client.
 
 ## Phase 2+ — Ecosystem
@@ -46,8 +47,8 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 
 ## Current status
 
-Phase 1 is active. Sync v3 uses deterministic Merkle buckets to localize divergent
-message IDs before bidirectional transfer, and the MCP interface lets AI agents read
-and write coordination logs.
+Phase 1 is active. Sync v4 reconciles signed policy prefixes before using
+deterministic Merkle buckets to localize divergent messages, and the MCP interface
+lets AI agents read and write coordination logs.
 
 Related: [[../decisions/adr-001-log-storage]], [[../decisions/adr-template]]

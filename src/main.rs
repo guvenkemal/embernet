@@ -54,6 +54,16 @@ enum Commands {
     /// Rebuild policy.json from the verified signed history
     ChannelPolicyRebuild { channel: String },
 
+    /// List saved valid policy-history forks
+    ChannelPolicyConflicts { channel: String },
+
+    /// Select a saved valid policy-history head
+    ChannelPolicyResolve {
+        channel: String,
+        #[arg(long)]
+        head: String,
+    },
+
     /// Restrict channel writes and make the local identity its owner
     ChannelRestrict { channel: String },
 
@@ -174,6 +184,17 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&store::rebuild_policy_cache(&datadir, &chan)?)?
             );
+        }
+        Commands::ChannelPolicyConflicts { channel } => {
+            let chan = ChannelRef::parse(&channel)?;
+            for head in store::list_policy_conflicts(&datadir, &chan)? {
+                println!("{head}");
+            }
+        }
+        Commands::ChannelPolicyResolve { channel, head } => {
+            let chan = ChannelRef::parse(&channel)?;
+            let policy = store::resolve_policy_conflict(&datadir, &chan, &head)?;
+            println!("{}", serde_json::to_string_pretty(&policy)?);
         }
         Commands::ChannelRestrict { channel } => {
             let chan = ChannelRef::parse(&channel)?;
