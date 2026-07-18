@@ -10,6 +10,7 @@ Start from [[adr-template]].
 
 - [[adr-001-log-storage]] — Store channel logs as newline-delimited JSON.
 - [[adr-002-id-inventory-sync]] — Reconcile divergent peers by message-ID inventory.
+- [[adr-003-locked-durable-channel-appends]] — Serialize durable channel writes and detect corruption.
 
 ## Suggested ADRs
 

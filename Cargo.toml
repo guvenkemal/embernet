@@ -16,6 +16,7 @@ thiserror = "1"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 base64 = "0.22"
 hex = "0.4"
+fs2 = "0.4"
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 axum = { version = "0.7", features = ["macros", "ws"] }

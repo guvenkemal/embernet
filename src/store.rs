@@ -1,8 +1,9 @@
 use crate::proto::Envelope;
 use crate::util::{channel_to_path, ensure_dir, valid_channel};
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -31,65 +32,118 @@ pub fn init_layout(base: &Path) -> Result<()> {
 pub fn create_channel(base: &Path, chan: &ChannelRef) -> Result<()> {
     let p = channel_to_path(base, &chan.full_name);
     ensure_dir(&p)?;
-    std::fs::write(p.join("log.ndjson"), b"")?;
+    let log = p.join("log.ndjson");
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .with_context(|| format!("create {}", log.display()))?;
     Ok(())
 }
 
 pub fn append_message(base: &Path, chan: &ChannelRef, env: &Envelope) -> Result<String> {
     let p = channel_to_path(base, &chan.full_name).join("log.ndjson");
+    if env.channel != chan.full_name {
+        bail!(
+            "envelope {} belongs to {}, not {}",
+            env.id,
+            env.channel,
+            chan.full_name
+        );
+    }
+    env.verify()
+        .with_context(|| format!("refusing to append invalid envelope {}", env.id))?;
+    let mut record = serde_json::to_vec(env).context("serialize envelope")?;
+    record.push(b'\n');
 
-    // Dedup: skip if this id already exists in the log.
-    if p.exists() && log_contains_id(&p, &env.id)? {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(&p)
+        .with_context(|| format!("open {}", p.display()))?;
+    FileExt::lock_exclusive(&file).with_context(|| format!("lock {}", p.display()))?;
+
+    file.seek(SeekFrom::Start(0))?;
+    let existing = read_verified_file(&mut file, &p)?;
+    if existing.iter().any(|existing| existing.id == env.id) {
         tracing::debug!("append_message: duplicate id {}, skipping", env.id);
         return Ok(env.id.clone());
     }
 
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&p)
-        .with_context(|| format!("open {}", p.display()))?;
-    serde_json::to_writer(&mut f, &env)?;
-    f.write_all(b"\n")?;
+    file.write_all(&record)
+        .with_context(|| format!("append {}", p.display()))?;
+    file.flush()
+        .with_context(|| format!("flush {}", p.display()))?;
+    file.sync_data()
+        .with_context(|| format!("sync {}", p.display()))?;
     Ok(env.id.clone())
 }
 
-/// Check whether a log file already contains a line with the given id.
-///
-/// The id is a 64-char hex string (blake3 output). We scan each line
-/// for the id substring — false positives are astronomically unlikely
-/// and this avoids deserializing every envelope.
-fn log_contains_id(path: &Path, id: &str) -> Result<bool> {
-    let file = OpenOptions::new().read(true).open(path)?;
-    let reader = BufReader::new(file);
-    for line in reader.lines() {
-        let line = line?;
-        if line.contains(id) {
-            return Ok(true);
+fn read_verified_log(path: &Path) -> Result<Vec<Envelope>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    FileExt::lock_shared(&file).with_context(|| format!("lock {}", path.display()))?;
+    read_verified_file(&mut file, path)
+}
+
+fn read_verified_file(file: &mut std::fs::File, path: &Path) -> Result<Vec<Envelope>> {
+    let mut reader = BufReader::new(file);
+    let mut envelopes = Vec::new();
+    let mut bytes = Vec::new();
+    let mut line_number = 0_usize;
+
+    loop {
+        bytes.clear();
+        let read = reader
+            .read_until(b'\n', &mut bytes)
+            .with_context(|| format!("read {} at line {}", path.display(), line_number + 1))?;
+        if read == 0 {
+            break;
         }
+        line_number += 1;
+        if !bytes.ends_with(b"\n") {
+            bail!(
+                "corrupt log {} at line {}: truncated record (missing newline)",
+                path.display(),
+                line_number
+            );
+        }
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+
+        let env: Envelope = serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "corrupt log {} at line {}: invalid envelope JSON",
+                path.display(),
+                line_number
+            )
+        })?;
+        env.verify().with_context(|| {
+            format!(
+                "corrupt log {} at line {}: envelope {} failed verification",
+                path.display(),
+                line_number,
+                env.id
+            )
+        })?;
+        envelopes.push(env);
     }
-    Ok(false)
+    Ok(envelopes)
 }
 
 pub fn read_channel_tail(base: &Path, chan: &ChannelRef, n: usize) -> Result<Vec<Envelope>> {
     let p = channel_to_path(base, &chan.full_name).join("log.ndjson");
-    let file = OpenOptions::new().read(true).open(&p)?;
-    let reader = BufReader::new(file);
-    let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
-    let start = lines.len().saturating_sub(n);
-
-    let mut out = Vec::new();
-    for ln in &lines[start..] {
-        if ln.trim().is_empty() {
-            continue;
-        }
-        let env: Envelope = serde_json::from_str(ln)?;
-        // hard fail if signature doesn't verify
-        env.verify()
-            .map_err(|e| anyhow::anyhow!("bad sig for {}: {}", env.id, e))?;
-        out.push(env);
-    }
-    Ok(out)
+    let envelopes = read_verified_log(&p)?;
+    let start = envelopes.len().saturating_sub(n);
+    Ok(envelopes[start..].to_vec())
 }
 
 /// Count total messages (non-empty lines) in a channel log.
@@ -99,41 +153,19 @@ pub fn count_messages(base: &Path, chan: &ChannelRef) -> Result<u64> {
     if !p.exists() {
         return Ok(0);
     }
-    let file = OpenOptions::new().read(true).open(&p)?;
-    let reader = BufReader::new(file);
-    let count = reader
-        .lines()
-        .map_while(Result::ok)
-        .filter(|l| !l.trim().is_empty())
-        .count() as u64;
-    Ok(count)
+    Ok(read_verified_log(&p)?.len() as u64)
 }
 
 /// Read envelopes starting from `from` (0-indexed) to end of log.
 /// Each envelope is verified before being returned.
 pub fn read_channel_from(base: &Path, chan: &ChannelRef, from: u64) -> Result<Vec<Envelope>> {
     let p = channel_to_path(base, &chan.full_name).join("log.ndjson");
-    let file = OpenOptions::new().read(true).open(&p)?;
-    let reader = BufReader::new(file);
-    let lines: Vec<String> = reader
-        .lines()
-        .map_while(Result::ok)
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-
+    let envelopes = read_verified_log(&p)?;
     let from = from as usize;
-    if from >= lines.len() {
+    if from >= envelopes.len() {
         return Ok(Vec::new());
     }
-
-    let mut out = Vec::new();
-    for ln in &lines[from..] {
-        let env: Envelope = serde_json::from_str(ln)?;
-        env.verify()
-            .map_err(|e| anyhow::anyhow!("bad sig for {}: {}", env.id, e))?;
-        out.push(env);
-    }
-    Ok(out)
+    Ok(envelopes[from..].to_vec())
 }
 
 /// Read and verify every envelope in a channel.
@@ -155,6 +187,7 @@ mod tests {
     use super::*;
     use crate::proto::{Envelope, KeypairFile, Message};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -256,5 +289,146 @@ mod tests {
             message_ids(&base, &chan).unwrap(),
             vec![first.id, second.id]
         );
+    }
+
+    #[test]
+    fn create_channel_preserves_existing_log() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/chan").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let env = Envelope::sign(
+            KeypairFile::generate(Some("tester".into())),
+            &chan.full_name,
+            Message::new_text(None, vec![], "keep me".into(), vec![]),
+        )
+        .unwrap();
+        append_message(&base, &chan, &env).unwrap();
+
+        create_channel(&base, &chan).unwrap();
+
+        assert_eq!(message_ids(&base, &chan).unwrap(), vec![env.id]);
+    }
+
+    #[test]
+    fn concurrent_duplicate_appends_write_one_record() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/concurrent").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let env = Arc::new(
+            Envelope::sign(
+                KeypairFile::generate(Some("tester".into())),
+                &chan.full_name,
+                Message::new_text(None, vec![], "same message".into(), vec![]),
+            )
+            .unwrap(),
+        );
+        let barrier = Arc::new(Barrier::new(16));
+        let mut threads = Vec::new();
+        for _ in 0..16 {
+            let base = base.clone();
+            let chan = chan.clone();
+            let env = Arc::clone(&env);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                append_message(&base, &chan, &env).unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(count_messages(&base, &chan).unwrap(), 1);
+    }
+
+    #[test]
+    fn concurrent_distinct_appends_remain_valid() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/concurrent").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let barrier = Arc::new(Barrier::new(16));
+        let mut threads = Vec::new();
+        for n in 0..16 {
+            let base = base.clone();
+            let chan = chan.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                let env = Envelope::sign(
+                    KeypairFile::generate(Some(format!("tester-{n}"))),
+                    &chan.full_name,
+                    Message::new_text(None, vec![], format!("message {n}"), vec![]),
+                )
+                .unwrap();
+                barrier.wait();
+                append_message(&base, &chan, &env).unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let ids = message_ids(&base, &chan).unwrap();
+        assert_eq!(ids.len(), 16);
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            16
+        );
+    }
+
+    #[test]
+    fn truncated_record_reports_file_and_line() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/corrupt").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let path = channel_to_path(&base, &chan.full_name).join("log.ndjson");
+        std::fs::write(&path, br#"{"id":"unfinished"}"#).unwrap();
+
+        let error = read_channel_all(&base, &chan).unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains("line 1"));
+        assert!(error.contains("truncated record"));
+    }
+
+    #[test]
+    fn invalid_record_reports_file_and_line() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/corrupt").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let path = channel_to_path(&base, &chan.full_name).join("log.ndjson");
+        std::fs::write(&path, b"not-json\n").unwrap();
+
+        let error = read_channel_all(&base, &chan).unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains("line 1"));
+        assert!(error.contains("invalid envelope JSON"));
+    }
+
+    #[test]
+    fn unverifiable_record_reports_file_and_line() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/corrupt").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let path = channel_to_path(&base, &chan.full_name).join("log.ndjson");
+        let mut env = Envelope::sign(
+            KeypairFile::generate(Some("tester".into())),
+            &chan.full_name,
+            Message::new_text(None, vec![], "original".into(), vec![]),
+        )
+        .unwrap();
+        env.sig = "00".repeat(64);
+        let mut record = serde_json::to_vec(&env).unwrap();
+        record.push(b'\n');
+        std::fs::write(&path, record).unwrap();
+
+        let error = read_channel_all(&base, &chan).unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains("line 1"));
+        assert!(error.contains("failed verification"));
     }
 }

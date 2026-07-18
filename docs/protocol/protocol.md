@@ -19,7 +19,14 @@ Examples:
 ./data/channels/local/coordination/log.ndjson
 ```
 
-Each non-empty line in `log.ndjson` is one serialized `Envelope` JSON object. The file is append-only in normal operation.
+Each non-empty line in `log.ndjson` is one serialized `Envelope` JSON object. The
+file is append-only in normal operation. Writers take an exclusive advisory lock
+across validation, deduplication, append, flush, and data synchronization. Readers
+take a shared lock and verify the complete records they consume.
+
+A final record without a newline is treated as truncated. Invalid JSON, failed
+envelope verification, and read errors are treated as corruption and include the
+log path and line number in the reported error.
 
 ## Channel names
 
@@ -222,7 +229,7 @@ so retrying a partially completed sync is safe.
 
 - Inventories are linear in channel size and capped at 100,000 IDs per exchange.
 - One channel is reconciled per WebSocket connection.
-- Logs do not yet use locking or a persistent ID index.
+- Logs do not yet use a persistent ID index.
 - `POST /sync` is not implemented in the current code; the active path is WebSocket `GET /sync`.
 
 These limitations should be considered candidates for future ADRs in [[../decisions/README]].

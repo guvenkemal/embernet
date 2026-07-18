@@ -19,8 +19,8 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - Count-based WebSocket Have/Want sync ✅
 - Divergence-safe, bidirectional ID-inventory sync ✅
 - MCP interface for AI agents ✅
+- Concurrent append safety and corruption detection ✅
 - next: indexed inventories and Merkle chunks for large-log delta sync.
-- next: concurrent append safety and corruption detection.
 - planned: channel ACLs and moderation tools.
 - planned: TUI or Web UI client.
 
