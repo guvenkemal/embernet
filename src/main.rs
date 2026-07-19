@@ -6,7 +6,9 @@ mod sync;
 mod util;
 
 use crate::proto::{Envelope, KeypairFile, Message};
-use crate::store::{ChannelRef, PolicyRole, append_message, init_layout, read_channel_tail};
+use crate::store::{
+    ChannelRef, PolicyRole, append_message, init_layout, read_channel_tail_with_options,
+};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -84,6 +86,30 @@ enum Commands {
     /// Transfer channel ownership to an Ed25519 public key
     ChannelTransferOwner { channel: String, public_key: String },
 
+    /// Tombstone a message in normal channel views
+    ModerateTombstone {
+        channel: String,
+        message_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Restore a tombstoned message
+    ModerateRestore { channel: String, message_id: String },
+
+    /// Show the verified moderation event history
+    ModerationHistory { channel: String },
+
+    /// List saved moderation-history forks
+    ModerationConflicts { channel: String },
+
+    /// Select a saved moderation-history head
+    ModerationResolve {
+        channel: String,
+        #[arg(long)]
+        head: String,
+    },
+
     /// Post a text message into a channel
     Post {
         channel: String,
@@ -102,6 +128,8 @@ enum Commands {
         channel: String,
         #[arg(long, default_value_t = 20)]
         n: usize,
+        #[arg(long)]
+        include_tombstoned: bool,
     },
 
     /// Run the HTTP status and WebSocket sync server
@@ -231,6 +259,43 @@ async fn main() -> Result<()> {
             let policy = store::transfer_ownership(&datadir, &chan, &identity, &public_key)?;
             println!("{}", serde_json::to_string_pretty(&policy)?);
         }
+        Commands::ModerateTombstone {
+            channel,
+            message_id,
+            reason,
+        } => {
+            let chan = ChannelRef::parse(&channel)?;
+            let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
+            let state = store::tombstone_message(&datadir, &chan, &identity, &message_id, reason)?;
+            println!("{}", serde_json::to_string_pretty(&state)?);
+        }
+        Commands::ModerateRestore {
+            channel,
+            message_id,
+        } => {
+            let chan = ChannelRef::parse(&channel)?;
+            let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
+            let state = store::restore_message(&datadir, &chan, &identity, &message_id)?;
+            println!("{}", serde_json::to_string_pretty(&state)?);
+        }
+        Commands::ModerationHistory { channel } => {
+            let chan = ChannelRef::parse(&channel)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store::read_moderation_history(&datadir, &chan)?)?
+            );
+        }
+        Commands::ModerationConflicts { channel } => {
+            let chan = ChannelRef::parse(&channel)?;
+            for head in store::list_moderation_conflicts(&datadir, &chan)? {
+                println!("{head}");
+            }
+        }
+        Commands::ModerationResolve { channel, head } => {
+            let chan = ChannelRef::parse(&channel)?;
+            let state = store::resolve_moderation_conflict(&datadir, &chan, &head)?;
+            println!("{}", serde_json::to_string_pretty(&state)?);
+        }
         Commands::Post {
             channel,
             title,
@@ -245,9 +310,13 @@ async fn main() -> Result<()> {
             let id = append_message(&datadir, &chan, &env)?;
             println!("posted {} -> {}", channel, id);
         }
-        Commands::Tail { channel, n } => {
+        Commands::Tail {
+            channel,
+            n,
+            include_tombstoned,
+        } => {
             let chan = ChannelRef::parse(&channel)?;
-            let msgs = read_channel_tail(&datadir, &chan, n)?;
+            let msgs = read_channel_tail_with_options(&datadir, &chan, n, include_tombstoned)?;
             for e in msgs {
                 println!(
                     "{} | {} | {}\n{}\n",

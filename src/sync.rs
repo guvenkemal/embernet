@@ -11,9 +11,10 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-const SYNC_VERSION: u32 = 4;
+const SYNC_VERSION: u32 = 5;
 const MAX_DIFFERING_IDS: usize = 100_000;
 const MAX_POLICY_EVENTS: usize = 10_000;
+const MAX_MODERATION_EVENTS: usize = 100_000;
 
 #[derive(Debug, Deserialize)]
 struct StatusMessage {
@@ -22,6 +23,7 @@ struct StatusMessage {
     version: u32,
     channel: String,
     policy_events: Vec<store::PolicyEvent>,
+    moderation_events: Vec<store::ModerationEvent>,
     chunks: Vec<store::ChunkSummary>,
 }
 
@@ -31,6 +33,14 @@ struct PolicySync {
     msg_type: String,
     status: String,
     events: Vec<store::PolicyEvent>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ModerationSync {
+    #[serde(rename = "type")]
+    msg_type: String,
+    status: String,
+    events: Vec<store::ModerationEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +115,9 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
     if status.policy_events.len() > MAX_POLICY_EVENTS {
         bail!("policy history exceeds {MAX_POLICY_EVENTS} events");
     }
+    if status.moderation_events.len() > MAX_MODERATION_EVENTS {
+        bail!("moderation history exceeds {MAX_MODERATION_EVENTS} events");
+    }
     if status.chunks.len() > store::MERKLE_BUCKET_COUNT
         || status
             .chunks
@@ -139,6 +152,30 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
     })?))
     .await
     .context("send policy sync")?;
+    store::validate_moderation_history(datadir, &chan, &status.moderation_events)?;
+    let local_moderation = store::read_moderation_history(datadir, &chan)?;
+    let local_prefix = is_moderation_prefix(&local_moderation, &status.moderation_events);
+    let remote_prefix = is_moderation_prefix(&status.moderation_events, &local_moderation);
+    if !local_prefix && !remote_prefix {
+        store::save_moderation_conflict(datadir, &chan, &status.moderation_events)?;
+        ws.send(Message::Text(serde_json::to_string(&ModerationSync {
+            msg_type: "moderation_sync".into(),
+            status: "conflict".into(),
+            events: local_moderation,
+        })?))
+        .await?;
+        bail!("moderation history fork");
+    }
+    if local_prefix && status.moderation_events.len() > local_moderation.len() {
+        store::append_remote_moderation_history(datadir, &chan, &status.moderation_events)?;
+    }
+    ws.send(Message::Text(serde_json::to_string(&ModerationSync {
+        msg_type: "moderation_sync".into(),
+        status: "update".into(),
+        events: store::read_moderation_history(datadir, &chan)?,
+    })?))
+    .await
+    .context("send moderation sync")?;
     let server_summaries = store::chunk_summaries(datadir, &chan)?;
     let client_hashes: std::collections::HashMap<u64, &str> = status
         .chunks
@@ -259,6 +296,17 @@ fn is_policy_prefix(prefix: &[store::PolicyEvent], history: &[store::PolicyEvent
             .all(|(left, right)| left.id == right.id)
 }
 
+fn is_moderation_prefix(
+    prefix: &[store::ModerationEvent],
+    history: &[store::ModerationEvent],
+) -> bool {
+    prefix.len() <= history.len()
+        && prefix
+            .iter()
+            .zip(history)
+            .all(|(left, right)| left.id == right.id)
+}
+
 async fn read_status(ws: &mut WebSocket) -> Result<StatusMessage> {
     let msg = ws
         .next()
@@ -297,11 +345,13 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
     let chan = ChannelRef::parse(channel)?;
     let local_chunks = store::chunk_summaries(datadir, &chan)?;
     let policy_events = store::read_policy_history(datadir, &chan)?;
+    let moderation_events = store::read_moderation_history(datadir, &chan)?;
     let status = serde_json::json!({
         "type": "status",
         "version": SYNC_VERSION,
         "channel": channel,
         "policy_events": policy_events,
+        "moderation_events": moderation_events,
         "chunks": local_chunks,
     });
 
@@ -344,6 +394,20 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
                 bail!("unexpected policy sync status {}", policy.status);
             }
             store::append_remote_policy_history(datadir, &chan, &policy.events)?;
+            continue;
+        }
+
+        if let Ok(moderation) = serde_json::from_str::<ModerationSync>(&text)
+            && moderation.msg_type == "moderation_sync"
+        {
+            if moderation.status == "conflict" {
+                store::save_moderation_conflict(datadir, &chan, &moderation.events)?;
+                bail!("moderation history fork");
+            }
+            if moderation.status != "update" {
+                bail!("unexpected moderation sync status {}", moderation.status);
+            }
+            store::append_remote_moderation_history(datadir, &chan, &moderation.events)?;
             continue;
         }
 
@@ -405,8 +469,9 @@ mod tests {
     use super::*;
     use crate::proto::{KeypairFile, Message};
     use crate::store::{
-        PolicyRole, create_channel, grant_role, init_layout, list_policy_conflicts, message_ids,
-        read_policy_history, restrict_channel,
+        PolicyRole, create_channel, grant_role, init_layout, list_moderation_conflicts,
+        list_policy_conflicts, message_ids, moderation_state, read_policy_history,
+        restrict_channel, tombstone_message,
     };
     use crate::util::channel_to_path;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -595,5 +660,71 @@ mod tests {
         assert!(sync_once(&server_dir, &client_dir, &chan).await.is_err());
         assert_eq!(list_policy_conflicts(&server_dir, &chan).unwrap().len(), 1);
         assert_eq!(list_policy_conflicts(&client_dir, &chan).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn moderation_prefix_syncs_before_message_views() {
+        let server_dir = temp_dir("mod_server");
+        let client_dir = temp_dir("mod_client");
+        let chan = ChannelRef::parse("test/mod-sync").unwrap();
+        for dir in [&server_dir, &client_dir] {
+            init_layout(dir).unwrap();
+            create_channel(dir, &chan).unwrap();
+        }
+        let owner = KeypairFile::generate(None);
+        restrict_channel(&server_dir, &chan, &owner).unwrap();
+        copy_policy_history(&server_dir, &client_dir, &chan);
+        let env = Envelope::sign(
+            owner.clone(),
+            &chan.full_name,
+            Message::new_text(None, vec![], "moderated".into(), vec![]),
+        )
+        .unwrap();
+        append_message(&server_dir, &chan, &env).unwrap();
+        append_message(&client_dir, &chan, &env).unwrap();
+        tombstone_message(&server_dir, &chan, &owner, &env.id, Some("spam".into())).unwrap();
+
+        sync_once(&server_dir, &client_dir, &chan).await.unwrap();
+        assert!(
+            moderation_state(&client_dir, &chan)
+                .unwrap()
+                .tombstoned
+                .contains_key(&env.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn moderation_fork_is_saved_and_blocks_message_sync() {
+        let server_dir = temp_dir("mod_fork_server");
+        let client_dir = temp_dir("mod_fork_client");
+        let chan = ChannelRef::parse("test/mod-fork").unwrap();
+        for dir in [&server_dir, &client_dir] {
+            init_layout(dir).unwrap();
+            create_channel(dir, &chan).unwrap();
+        }
+        let owner = KeypairFile::generate(None);
+        restrict_channel(&server_dir, &chan, &owner).unwrap();
+        copy_policy_history(&server_dir, &client_dir, &chan);
+        let env = Envelope::sign(
+            owner.clone(),
+            &chan.full_name,
+            Message::new_text(None, vec![], "target".into(), vec![]),
+        )
+        .unwrap();
+        for dir in [&server_dir, &client_dir] {
+            append_message(dir, &chan, &env).unwrap();
+        }
+        tombstone_message(&server_dir, &chan, &owner, &env.id, Some("server".into())).unwrap();
+        tombstone_message(&client_dir, &chan, &owner, &env.id, Some("client".into())).unwrap();
+
+        assert!(sync_once(&server_dir, &client_dir, &chan).await.is_err());
+        assert_eq!(
+            list_moderation_conflicts(&server_dir, &chan).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            list_moderation_conflicts(&client_dir, &chan).unwrap().len(),
+            1
+        );
     }
 }

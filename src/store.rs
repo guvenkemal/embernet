@@ -102,6 +102,45 @@ struct PolicyEventPayload<'a> {
     action: &'a PolicyAction,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModerationAction {
+    Tombstone {
+        target: String,
+        reason: Option<String>,
+    },
+    Restore {
+        target: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModerationEvent {
+    pub id: String,
+    pub channel: String,
+    pub actor: String,
+    pub ts: i64,
+    pub previous: Option<String>,
+    pub policy_head: String,
+    pub action: ModerationAction,
+    pub sig: String,
+}
+
+#[derive(Serialize)]
+struct ModerationEventPayload<'a> {
+    channel: &'a str,
+    actor: &'a str,
+    ts: i64,
+    previous: &'a Option<String>,
+    policy_head: &'a str,
+    action: &'a ModerationAction,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModerationState {
+    pub tombstoned: std::collections::BTreeMap<String, Option<String>>,
+}
+
 #[derive(Debug)]
 struct ScannedEnvelope {
     envelope: Envelope,
@@ -645,6 +684,327 @@ fn write_policy_cache(base: &Path, chan: &ChannelRef, policy: &ChannelPolicy) ->
     Ok(())
 }
 
+fn moderation_log_path(base: &Path, chan: &ChannelRef) -> PathBuf {
+    channel_to_path(base, &chan.full_name).join("moderation.ndjson")
+}
+
+fn moderation_cache_path(base: &Path, chan: &ChannelRef) -> PathBuf {
+    channel_to_path(base, &chan.full_name).join("moderation.json")
+}
+
+pub fn read_moderation_history(base: &Path, chan: &ChannelRef) -> Result<Vec<ModerationEvent>> {
+    let path = moderation_log_path(base, chan);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let reader = BufReader::new(std::fs::File::open(&path)?);
+    let mut events = Vec::new();
+    for (line_index, line) in reader.lines().enumerate() {
+        let line =
+            line.with_context(|| format!("read {} line {}", path.display(), line_index + 1))?;
+        if !line.trim().is_empty() {
+            events.push(serde_json::from_str(&line).with_context(|| {
+                format!(
+                    "invalid moderation event {} line {}",
+                    path.display(),
+                    line_index + 1
+                )
+            })?);
+        }
+    }
+    derive_moderation(base, chan, &events)?;
+    Ok(events)
+}
+
+pub fn moderation_state(base: &Path, chan: &ChannelRef) -> Result<ModerationState> {
+    derive_moderation(base, chan, &read_moderation_history(base, chan)?)
+}
+
+pub fn tombstone_message(
+    base: &Path,
+    chan: &ChannelRef,
+    signer: &KeypairFile,
+    target: &str,
+    reason: Option<String>,
+) -> Result<ModerationState> {
+    read_message_by_id(base, chan, target).context("cannot tombstone an unknown message")?;
+    append_moderation_action(
+        base,
+        chan,
+        signer,
+        ModerationAction::Tombstone {
+            target: target.to_string(),
+            reason,
+        },
+    )
+}
+
+pub fn restore_message(
+    base: &Path,
+    chan: &ChannelRef,
+    signer: &KeypairFile,
+    target: &str,
+) -> Result<ModerationState> {
+    append_moderation_action(
+        base,
+        chan,
+        signer,
+        ModerationAction::Restore {
+            target: target.to_string(),
+        },
+    )
+}
+
+fn append_moderation_action(
+    base: &Path,
+    chan: &ChannelRef,
+    signer: &KeypairFile,
+    action: ModerationAction,
+) -> Result<ModerationState> {
+    let log_path = channel_to_path(base, &chan.full_name).join("log.ndjson");
+    let log = OpenOptions::new().read(true).open(&log_path)?;
+    FileExt::lock_exclusive(&log).with_context(|| format!("lock {}", log_path.display()))?;
+    let mut events = read_moderation_history(base, chan)?;
+    let previous = events.last().map(|event| event.id.clone());
+    let policy_head = read_policy_history(base, chan)?
+        .last()
+        .context("moderation requires a signed restricted policy")?
+        .id
+        .clone();
+    events.push(sign_moderation_event(
+        chan,
+        signer,
+        previous,
+        policy_head,
+        action,
+    )?);
+    let state = derive_moderation(base, chan, &events)?;
+    let path = moderation_log_path(base, chan);
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    serde_json::to_writer(&mut file, events.last().expect("event was appended"))?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    file.sync_data()?;
+    write_moderation_cache(base, chan, &state)?;
+    Ok(state)
+}
+
+fn sign_moderation_event(
+    chan: &ChannelRef,
+    signer: &KeypairFile,
+    previous: Option<String>,
+    policy_head: String,
+    action: ModerationAction,
+) -> Result<ModerationEvent> {
+    let ts = chrono::Utc::now().timestamp();
+    let payload = serde_json::to_vec(&ModerationEventPayload {
+        channel: &chan.full_name,
+        actor: &signer.public_key,
+        ts,
+        previous: &previous,
+        policy_head: &policy_head,
+        action: &action,
+    })?;
+    let id = hex::encode(blake3::hash(&payload).as_bytes());
+    let mut signed = b"embernet-moderation-v1\n".to_vec();
+    signed.extend_from_slice(&payload);
+    Ok(ModerationEvent {
+        id,
+        channel: chan.full_name.clone(),
+        actor: signer.public_key.clone(),
+        ts,
+        previous,
+        policy_head,
+        action,
+        sig: signer.sign_bytes(&signed)?,
+    })
+}
+
+pub fn validate_moderation_history(
+    base: &Path,
+    chan: &ChannelRef,
+    events: &[ModerationEvent],
+) -> Result<ModerationState> {
+    derive_moderation(base, chan, events)
+}
+
+fn derive_moderation(
+    base: &Path,
+    chan: &ChannelRef,
+    events: &[ModerationEvent],
+) -> Result<ModerationState> {
+    let policy_history = read_policy_history(base, chan)?;
+    let mut state = ModerationState::default();
+    let mut previous: Option<String> = None;
+    for event in events {
+        if event.channel != chan.full_name || event.previous != previous {
+            bail!("invalid moderation event chain at {}", event.id);
+        }
+        let policy_position = policy_history
+            .iter()
+            .position(|policy_event| policy_event.id == event.policy_head)
+            .with_context(|| format!("unknown policy head {}", event.policy_head))?;
+        let policy = derive_policy(chan, &policy_history[..=policy_position])?;
+        let authorized = policy.owner.as_deref() == Some(&event.actor)
+            || policy.moderators.iter().any(|key| key == &event.actor);
+        if !authorized {
+            bail!(
+                "actor {} is not allowed to moderate {}",
+                event.actor,
+                chan.full_name
+            );
+        }
+        let payload = serde_json::to_vec(&ModerationEventPayload {
+            channel: &event.channel,
+            actor: &event.actor,
+            ts: event.ts,
+            previous: &event.previous,
+            policy_head: &event.policy_head,
+            action: &event.action,
+        })?;
+        if event.id != hex::encode(blake3::hash(&payload).as_bytes()) {
+            bail!("moderation event {} has an invalid id", event.id);
+        }
+        let mut signed = b"embernet-moderation-v1\n".to_vec();
+        signed.extend_from_slice(&payload);
+        verify_bytes(&event.actor, &event.sig, &signed)
+            .with_context(|| format!("verify moderation event {}", event.id))?;
+        match &event.action {
+            ModerationAction::Tombstone { target, reason } => {
+                validate_public_key(target).context("invalid tombstone target")?;
+                state.tombstoned.insert(target.clone(), reason.clone());
+            }
+            ModerationAction::Restore { target } => {
+                validate_public_key(target).context("invalid restore target")?;
+                state.tombstoned.remove(target);
+            }
+        }
+        previous = Some(event.id.clone());
+    }
+    Ok(state)
+}
+
+pub fn append_remote_moderation_history(
+    base: &Path,
+    chan: &ChannelRef,
+    remote: &[ModerationEvent],
+) -> Result<ModerationState> {
+    let log_path = channel_to_path(base, &chan.full_name).join("log.ndjson");
+    let log = OpenOptions::new().read(true).open(&log_path)?;
+    FileExt::lock_exclusive(&log).with_context(|| format!("lock {}", log_path.display()))?;
+    let local = read_moderation_history(base, chan)?;
+    validate_moderation_history(base, chan, remote)?;
+    if local.len() > remote.len()
+        || !local
+            .iter()
+            .zip(remote)
+            .all(|(left, right)| left.id == right.id)
+    {
+        bail!("remote moderation history does not extend the local history");
+    }
+    if remote.len() > local.len() {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(moderation_log_path(base, chan))?;
+        for event in &remote[local.len()..] {
+            serde_json::to_writer(&mut file, event)?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        file.sync_data()?;
+    }
+    let state = derive_moderation(base, chan, remote)?;
+    write_moderation_cache(base, chan, &state)?;
+    Ok(state)
+}
+
+fn moderation_conflict_dir(base: &Path, chan: &ChannelRef) -> PathBuf {
+    channel_to_path(base, &chan.full_name).join("moderation-conflicts")
+}
+
+pub fn save_moderation_conflict(
+    base: &Path,
+    chan: &ChannelRef,
+    events: &[ModerationEvent],
+) -> Result<String> {
+    validate_moderation_history(base, chan, events)?;
+    let head = events
+        .last()
+        .context("cannot save an empty moderation conflict")?
+        .id
+        .clone();
+    let dir = moderation_conflict_dir(base, chan);
+    ensure_dir(&dir)?;
+    let path = dir.join(format!("{head}.ndjson"));
+    let mut bytes = Vec::new();
+    for event in events {
+        serde_json::to_writer(&mut bytes, event)?;
+        bytes.push(b'\n');
+    }
+    std::fs::write(path, bytes)?;
+    Ok(head)
+}
+
+pub fn list_moderation_conflicts(base: &Path, chan: &ChannelRef) -> Result<Vec<String>> {
+    let dir = moderation_conflict_dir(base, chan);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut heads = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && let Some(name) = entry.path().file_stem().and_then(|name| name.to_str())
+        {
+            heads.push(name.to_string());
+        }
+    }
+    heads.sort();
+    Ok(heads)
+}
+
+pub fn resolve_moderation_conflict(
+    base: &Path,
+    chan: &ChannelRef,
+    head: &str,
+) -> Result<ModerationState> {
+    validate_public_key(head).context("moderation head must be a 32-byte hex ID")?;
+    let path = moderation_conflict_dir(base, chan).join(format!("{head}.ndjson"));
+    let events: Vec<ModerationEvent> = std::fs::read_to_string(&path)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<_, _>>()?;
+    if events.last().map(|event| event.id.as_str()) != Some(head) {
+        bail!("saved moderation conflict does not match requested head");
+    }
+    let state = validate_moderation_history(base, chan, &events)?;
+    let channel_log_path = channel_to_path(base, &chan.full_name).join("log.ndjson");
+    let channel_log = OpenOptions::new().read(true).open(&channel_log_path)?;
+    FileExt::lock_exclusive(&channel_log)
+        .with_context(|| format!("lock {}", channel_log_path.display()))?;
+    let history_path = moderation_log_path(base, chan);
+    let temp = history_path.with_extension("ndjson.tmp");
+    let mut data = Vec::new();
+    for event in &events {
+        serde_json::to_writer(&mut data, event)?;
+        data.push(b'\n');
+    }
+    std::fs::write(&temp, data)?;
+    std::fs::rename(temp, history_path)?;
+    write_moderation_cache(base, chan, &state)?;
+    Ok(state)
+}
+
+fn write_moderation_cache(base: &Path, chan: &ChannelRef, state: &ModerationState) -> Result<()> {
+    let path = moderation_cache_path(base, chan);
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, serde_json::to_vec_pretty(state)?)?;
+    std::fs::rename(temp, path)?;
+    Ok(())
+}
+
 fn index_path(log_path: &Path) -> PathBuf {
     log_path.with_file_name("index.redb")
 }
@@ -864,8 +1224,21 @@ fn scan_verified_file(file: &mut std::fs::File, path: &Path) -> Result<Vec<Scann
 }
 
 pub fn read_channel_tail(base: &Path, chan: &ChannelRef, n: usize) -> Result<Vec<Envelope>> {
+    read_channel_tail_with_options(base, chan, n, false)
+}
+
+pub fn read_channel_tail_with_options(
+    base: &Path,
+    chan: &ChannelRef,
+    n: usize,
+    include_tombstoned: bool,
+) -> Result<Vec<Envelope>> {
     let p = channel_to_path(base, &chan.full_name).join("log.ndjson");
-    let envelopes = read_verified_log(&p)?;
+    let mut envelopes = read_verified_log(&p)?;
+    if !include_tombstoned {
+        let moderation = moderation_state(base, chan)?;
+        envelopes.retain(|env| !moderation.tombstoned.contains_key(&env.id));
+    }
     let start = envelopes.len().saturating_sub(n);
     Ok(envelopes[start..].to_vec())
 }
@@ -1495,5 +1868,94 @@ mod tests {
         let history = read_policy_history(&base, &chan).unwrap();
         assert_eq!(history.len(), 2);
         assert!(matches!(history[0].action, PolicyAction::Adopt { .. }));
+    }
+
+    #[test]
+    fn moderation_tombstones_filter_views_and_restore() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/moderation").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let owner = KeypairFile::generate(None);
+        let writer = KeypairFile::generate(None);
+        restrict_channel(&base, &chan, &owner).unwrap();
+        grant_role(&base, &chan, &owner, PolicyRole::Writer, &writer.public_key).unwrap();
+        let env = Envelope::sign(
+            writer.clone(),
+            &chan.full_name,
+            Message::new_text(None, vec![], "hide me".into(), vec![]),
+        )
+        .unwrap();
+        append_message(&base, &chan, &env).unwrap();
+
+        assert!(tombstone_message(&base, &chan, &writer, &env.id, None).is_err());
+        tombstone_message(&base, &chan, &owner, &env.id, Some("spam".into())).unwrap();
+        assert!(read_channel_tail(&base, &chan, 10).unwrap().is_empty());
+        assert_eq!(
+            read_channel_tail_with_options(&base, &chan, 10, true)
+                .unwrap()
+                .len(),
+            1
+        );
+        restore_message(&base, &chan, &owner, &env.id).unwrap();
+        assert_eq!(read_channel_tail(&base, &chan, 10).unwrap().len(), 1);
+        let history = read_moderation_history(&base, &chan).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].previous.as_deref(), Some(history[0].id.as_str()));
+    }
+
+    #[test]
+    fn tampered_moderation_event_is_rejected() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/moderation").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let owner = KeypairFile::generate(None);
+        restrict_channel(&base, &chan, &owner).unwrap();
+        let env = Envelope::sign(
+            owner.clone(),
+            &chan.full_name,
+            Message::new_text(None, vec![], "target".into(), vec![]),
+        )
+        .unwrap();
+        append_message(&base, &chan, &env).unwrap();
+        tombstone_message(&base, &chan, &owner, &env.id, None).unwrap();
+        let path = moderation_log_path(&base, &chan);
+        let mut event: ModerationEvent =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        event.sig = "00".repeat(64);
+        let mut record = serde_json::to_vec(&event).unwrap();
+        record.push(b'\n');
+        std::fs::write(path, record).unwrap();
+        assert!(read_moderation_history(&base, &chan).is_err());
+    }
+
+    #[test]
+    fn moderation_uses_policy_at_event_time() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/moderation-transfer").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let owner = KeypairFile::generate(None);
+        let successor = KeypairFile::generate(None);
+        restrict_channel(&base, &chan, &owner).unwrap();
+        let env = Envelope::sign(
+            owner.clone(),
+            &chan.full_name,
+            Message::new_text(None, vec![], "target".into(), vec![]),
+        )
+        .unwrap();
+        append_message(&base, &chan, &env).unwrap();
+        tombstone_message(&base, &chan, &owner, &env.id, None).unwrap();
+        transfer_ownership(&base, &chan, &owner, &successor.public_key).unwrap();
+
+        assert!(
+            moderation_state(&base, &chan)
+                .unwrap()
+                .tombstoned
+                .contains_key(&env.id)
+        );
+        assert!(restore_message(&base, &chan, &owner, &env.id).is_err());
+        restore_message(&base, &chan, &successor, &env.id).unwrap();
     }
 }

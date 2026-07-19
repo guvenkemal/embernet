@@ -16,6 +16,7 @@ Start from [[adr-template]].
 - [[adr-006-local-channel-write-acls]] — Enforce owner, moderator, and writer roles locally.
 - [[adr-007-signed-policy-event-chain]] — Derive policy from a signed, chained audit log.
 - [[adr-008-prefix-only-policy-federation]] — Reconcile policy prefixes and quarantine forks.
+- [[adr-009-signed-moderation-overlay]] — Hide or restore messages without deleting envelopes.
 
 ## Suggested ADRs
 

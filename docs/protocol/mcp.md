@@ -115,7 +115,7 @@ Example result:
 }
 ```
 
-Safety behavior: `read_channel_tail` verifies every envelope with `Envelope::verify()` before returning it. Invalid signatures should fail the tool call rather than returning untrusted log entries.
+Safety behavior: `read_channel_tail` verifies every envelope with `Envelope::verify()` before returning it and omits currently tombstoned messages. Invalid signatures or moderation histories fail the tool call rather than returning an untrusted view.
 
 ### `post_message`
 

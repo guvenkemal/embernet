@@ -66,6 +66,11 @@ embernet channel-restrict Restrict writes and claim ownership with the local ide
 embernet channel-grant    Grant a moderator or writer role
 embernet channel-revoke   Revoke a moderator or writer role
 embernet channel-transfer-owner Transfer ownership to another public key
+embernet moderate-tombstone Tombstone a message from normal views
+embernet moderate-restore Restore a tombstoned message
+embernet moderation-history Show signed moderation events
+embernet moderation-conflicts List saved moderation forks
+embernet moderation-resolve Select a saved moderation head
 embernet post             Post a signed text message
 embernet tail             Tail recent messages from a channel
 embernet serve            Run HTTP/WebSocket server (status + sync)
