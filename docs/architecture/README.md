@@ -5,6 +5,7 @@ This folder contains high-level system diagrams, flow notes, and architectural s
 ## Current modules
 
 - CLI entrypoint: `src/main.rs`
+- Interactive terminal client: `src/tui.rs`
 - Envelope and message types: `src/proto.rs`
 - File-backed append-only storage: `src/store.rs`
 - HTTP/WebSocket server: `src/server.rs`
@@ -27,6 +28,11 @@ remote sync
   -> server requests client-only ids
   -> peers exchange missing Envelope objects in both directions
   -> each peer Envelope::verify() + deduplicated append
+
+terminal client
+  -> shared channel discovery and storage APIs
+  -> moderated or audit timeline
+  -> signed local post or WebSocket peer sync
 ```
 
 Related: [[../protocol/protocol]]

@@ -183,6 +183,39 @@ pub fn create_channel(base: &Path, chan: &ChannelRef) -> Result<()> {
     Ok(())
 }
 
+pub fn list_channels(base: &Path) -> Result<Vec<String>> {
+    let root = base.join("channels");
+    let mut channels = Vec::new();
+    if root.exists() {
+        collect_channels(&root, &root, &mut channels)?;
+    }
+    channels.sort();
+    Ok(channels)
+}
+
+fn collect_channels(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_channels(root, &path, out)?;
+        } else if entry.file_name() == "log.ndjson"
+            && let Some(parent) = path.parent()
+        {
+            let channel = parent
+                .strip_prefix(root)?
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            if valid_channel(&channel) {
+                out.push(channel);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn append_message(base: &Path, chan: &ChannelRef, env: &Envelope) -> Result<String> {
     let p = channel_to_path(base, &chan.full_name).join("log.ndjson");
     if env.channel != chan.full_name {
@@ -1378,6 +1411,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn list_channels_finds_nested_channels_in_sorted_order() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        create_channel(&base, &ChannelRef::parse("tech/rust").unwrap()).unwrap();
+        create_channel(&base, &ChannelRef::parse("general").unwrap()).unwrap();
+
+        assert_eq!(
+            list_channels(&base).unwrap(),
+            vec!["general".to_string(), "tech/rust".to_string()]
+        );
     }
 
     #[test]

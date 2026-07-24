@@ -17,6 +17,7 @@ Start from [[adr-template]].
 - [[adr-007-signed-policy-event-chain]] — Derive policy from a signed, chained audit log.
 - [[adr-008-prefix-only-policy-federation]] — Reconcile policy prefixes and quarantine forks.
 - [[adr-009-signed-moderation-overlay]] — Hide or restore messages without deleting envelopes.
+- [[adr-010-thin-terminal-client]] — Build the first frontend as a thin terminal client.
 
 ## Suggested ADRs
 

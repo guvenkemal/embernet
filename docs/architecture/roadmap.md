@@ -26,8 +26,9 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - Signed policy audit events and ownership transfer ✅
 - Prefix-only policy federation and explicit fork handling ✅
 - Signed moderation events, federation, and filtered views ✅
-- next: first dedicated terminal client.
-- planned: TUI or Web UI client.
+- First dedicated terminal client ✅
+- next: private and encrypted channel support.
+- planned: Web UI client.
 
 ## Phase 2+ — Ecosystem
 
@@ -49,7 +50,7 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 ## Current status
 
 Phase 1 is active. Sync v5 reconciles signed policy and moderation histories before
-using deterministic Merkle buckets to localize divergent messages. CLI and MCP
-views omit tombstoned content while retaining the auditable underlying log.
+using deterministic Merkle buckets to localize divergent messages. CLI, MCP, and
+the interactive terminal client all use the same protocol and storage core.
 
 Related: [[../decisions/adr-001-log-storage]], [[../decisions/adr-template]]

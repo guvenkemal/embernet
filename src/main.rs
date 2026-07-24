@@ -3,6 +3,7 @@ mod proto;
 mod server;
 mod store;
 mod sync;
+mod tui;
 mod util;
 
 use crate::proto::{Envelope, KeypairFile, Message};
@@ -140,6 +141,9 @@ enum Commands {
 
     /// Run an MCP server over stdio for local AI clients
     Mcp,
+
+    /// Run the interactive terminal user interface
+    Tui,
 
     /// Sync messages from a remote peer via WebSocket Have/Want protocol
     Sync {
@@ -332,6 +336,9 @@ async fn main() -> Result<()> {
         }
         Commands::Mcp => {
             mcp::run_stdio(datadir)?;
+        }
+        Commands::Tui => {
+            tui::run(datadir).await?;
         }
         Commands::Sync { peer, channel } => {
             let received = sync::sync_from_peer(&datadir, &peer, &channel).await?;

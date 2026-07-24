@@ -35,7 +35,10 @@ curl http://127.0.0.1:4444/status | jq
 # 8) sync from another node (after setting up a second data dir)
 ./target/debug/embernet --data ~/.embernet-test-2 sync --peer ws://127.0.0.1:4444/sync tech/discuss
 
-# 9) run as an MCP stdio server for AI clients
+# 9) open the terminal client
+./target/debug/embernet --data ~/.embernet-test tui
+
+# 10) run as an MCP stdio server for AI clients
 ./target/debug/embernet --data ~/.embernet-test mcp
 ```
 
@@ -75,6 +78,7 @@ embernet post             Post a signed text message
 embernet tail             Tail recent messages from a channel
 embernet serve            Run HTTP/WebSocket server (status + sync)
 embernet sync             Pull messages from a remote peer via Have/Want
+embernet tui              Open the interactive terminal client
 embernet mcp              Run as an MCP stdio server for AI clients
 ```
 

@@ -1,10 +1,8 @@
 use crate::proto::{Envelope, KeypairFile, Message};
 use crate::store::{ChannelRef, append_message, read_channel_tail};
-use crate::util::valid_channel;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -257,42 +255,7 @@ fn parse_args<T: for<'de> Deserialize<'de>>(value: Value) -> std::result::Result
 }
 
 fn list_channels(datadir: &Path) -> Result<Vec<String>> {
-    let root = datadir.join("channels");
-    let mut channels = Vec::new();
-
-    if !root.exists() {
-        return Ok(channels);
-    }
-
-    collect_channels(&root, &root, &mut channels)?;
-    channels.sort();
-    Ok(channels)
-}
-
-fn collect_channels(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
-    for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-
-        if file_type.is_dir() {
-            collect_channels(root, &path, out)?;
-        } else if file_type.is_file() && entry.file_name() == "log.ndjson" {
-            let Some(parent) = path.parent() else {
-                continue;
-            };
-            let rel = parent.strip_prefix(root)?;
-            let channel = rel
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            if valid_channel(&channel) {
-                out.push(channel);
-            }
-        }
-    }
-    Ok(())
+    crate::store::list_channels(datadir)
 }
 
 fn tail_channel(datadir: &Path, args: TailChannelArgs) -> Result<(String, Vec<Envelope>)> {
