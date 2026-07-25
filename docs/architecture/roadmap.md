@@ -30,6 +30,7 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - Persistent peers, channel discovery, and automatic TUI sync ✅
 - Automatic TUI refresh for local server, CLI, MCP, and moderation writes ✅
 - Bottom-aware TUI follow-tail behavior for incoming messages ✅
+- Direct canonical identity generation during node initialization ✅
 - next: private and encrypted channel support.
 - planned: Web UI client.
 

@@ -9,41 +9,45 @@ WebSocket Have/Want sync, and MCP AI-agent integration.
 # 0) build
 cargo build
 
-# 1) set up a data directory (keep it outside the repo)
-mkdir -p ~/.embernet-test
+# 1) initialise a node and generate its identity
+./target/debug/embernet --data ~/.embernet-test init --alias "You"
 
-# 2) make a key (in the data dir, not the repo root)
-./target/debug/embernet --data ~/.embernet-test keygen --alias "You" --out ~/.embernet-test/identity.json
-
-# 3) initialise the data dir
-./target/debug/embernet --data ~/.embernet-test init --key ~/.embernet-test/identity.json
-
-# 4) create a channel
+# 2) create a channel
 ./target/debug/embernet --data ~/.embernet-test channel-create tech/discuss
 
-# 5) post something
+# 3) post something
 ./target/debug/embernet --data ~/.embernet-test post tech/discuss \
   --title "hello world" --body "first post from the bunker" --tags linux rust
 
-# 6) tail
+# 4) tail
 ./target/debug/embernet --data ~/.embernet-test tail tech/discuss --n 10
 
-# 7) start the HTTP + WebSocket server
+# 5) start the HTTP + WebSocket server
 ./target/debug/embernet --data ~/.embernet-test serve --listen 127.0.0.1:4444
 curl http://127.0.0.1:4444/status | jq
 
-# 8) sync from another node (after setting up a second data dir)
-./target/debug/embernet --data ~/.embernet-test-2 sync --peer ws://127.0.0.1:4444/sync tech/discuss
+# 6) initialise a second node
+./target/debug/embernet --data ~/.embernet-test-2 init --alias "Peer"
 
-# 9) save a peer for channel discovery and automatic TUI sync
+# 7) save the first node as its peer
 ./target/debug/embernet --data ~/.embernet-test-2 peer-add ws://127.0.0.1:4444/sync
 
-# 10) open the terminal client
+# 8) open the terminal client; it discovers and syncs the channel
 ./target/debug/embernet --data ~/.embernet-test-2 tui
 
-# 11) run as an MCP stdio server for AI clients
+# 9) run as an MCP stdio server for AI clients
 ./target/debug/embernet --data ~/.embernet-test mcp
 ```
+
+To import an existing identity instead of generating one:
+
+```bash
+./target/debug/embernet --data ~/.embernet-test init --key /path/to/identity.json
+```
+
+The imported source file is left unchanged. Embernet always uses
+`<data-directory>/keys/identity.json` as the node's canonical identity and refuses
+to overwrite it during a later `init`.
 
 ## Protocol
 
@@ -60,8 +64,8 @@ Full specification: `docs/protocol/protocol.md`
 ## Commands
 
 ```
-embernet keygen           Generate an ed25519 identity keypair
-embernet init             Initialise data directory with a keypair
+embernet keygen           Export a standalone ed25519 identity keypair
+embernet init             Initialise a node by generating or importing its identity
 embernet channel-create   Create a channel
 embernet channel-policy   Show a channel's local write policy
 embernet channel-policy-history Show verified signed policy events

@@ -11,9 +11,9 @@ use crate::proto::{Envelope, KeypairFile, Message};
 use crate::store::{
     ChannelRef, PolicyRole, append_message, init_layout, read_channel_tail_with_options,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -40,10 +40,14 @@ enum Commands {
         alias: Option<String>,
     },
 
-    /// Initialize data layout and copy key
+    /// Initialize data layout and create or import its identity
     Init {
-        #[arg(long, default_value = "identity.json")]
-        key: PathBuf,
+        /// Import an existing identity instead of generating one
+        #[arg(long, conflicts_with = "alias")]
+        key: Option<PathBuf>,
+        /// Alias for a newly generated identity
+        #[arg(long, conflicts_with = "key")]
+        alias: Option<String>,
     },
 
     /// Create a channel (e.g. tech/discuss)
@@ -195,10 +199,8 @@ async fn main() -> Result<()> {
             kp.save(&out)?;
             println!("wrote {}", out.display());
         }
-        Commands::Init { key } => {
-            init_layout(&datadir)?;
-            let kp = KeypairFile::load(&key).context("failed to read key file")?;
-            kp.save(&datadir.join("keys/identity.json"))?;
+        Commands::Init { key, alias } => {
+            initialize_identity(&datadir, key.as_deref(), alias)?;
             println!("initialized {}", datadir.display());
         }
         Commands::ChannelCreate { name } => {
@@ -377,4 +379,95 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn initialize_identity(
+    datadir: &Path,
+    import_path: Option<&Path>,
+    alias: Option<String>,
+) -> Result<KeypairFile> {
+    let identity_path = datadir.join("keys/identity.json");
+    if identity_path.exists() {
+        bail!(
+            "identity already exists at {}; refusing to overwrite it",
+            identity_path.display()
+        );
+    }
+
+    let identity = match import_path {
+        Some(path) => KeypairFile::load(path)
+            .with_context(|| format!("failed to read identity {}", path.display()))?,
+        None => KeypairFile::generate(alias),
+    };
+    init_layout(datadir)?;
+    identity.save(&identity_path)?;
+    Ok(identity)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "embernet_init_{label}_{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    #[test]
+    fn init_generates_only_the_canonical_identity() {
+        let datadir = temp_dir("generate");
+        let generated = initialize_identity(&datadir, None, Some("Alice".into())).unwrap();
+
+        assert_eq!(generated.alias.as_deref(), Some("Alice"));
+        assert!(datadir.join("keys/identity.json").is_file());
+        assert!(!datadir.join("identity.json").exists());
+    }
+
+    #[test]
+    fn init_imports_an_existing_identity_without_modifying_source() {
+        let source_dir = temp_dir("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source_path = source_dir.join("identity.json");
+        let source = KeypairFile::generate(Some("Imported".into()));
+        source.save(&source_path).unwrap();
+        let datadir = temp_dir("import");
+
+        let imported = initialize_identity(&datadir, Some(&source_path), None).unwrap();
+
+        assert_eq!(imported.public_key, source.public_key);
+        assert_eq!(imported.secret_key, source.secret_key);
+        assert!(source_path.is_file());
+    }
+
+    #[test]
+    fn init_refuses_to_overwrite_an_existing_identity() {
+        let datadir = temp_dir("overwrite");
+        let original = initialize_identity(&datadir, None, Some("Original".into())).unwrap();
+
+        assert!(initialize_identity(&datadir, None, Some("Replacement".into())).is_err());
+        let stored = KeypairFile::load(&datadir.join("keys/identity.json")).unwrap();
+        assert_eq!(stored.public_key, original.public_key);
+    }
+
+    #[test]
+    fn init_rejects_key_and_alias_together() {
+        assert!(
+            Cli::try_parse_from([
+                "embernet",
+                "init",
+                "--key",
+                "identity.json",
+                "--alias",
+                "Alice",
+            ])
+            .is_err()
+        );
+    }
 }
