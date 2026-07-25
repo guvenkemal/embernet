@@ -22,8 +22,10 @@ cargo build
 # 4) tail
 ./target/debug/embernet --data ~/.embernet-test tail tech/discuss --n 10
 
-# 5) start the HTTP + WebSocket server
-./target/debug/embernet --data ~/.embernet-test serve --listen 127.0.0.1:4444
+# 5) open the first TUI and accept peer connections
+./target/debug/embernet --data ~/.embernet-test tui --listen 127.0.0.1:4444
+
+# from another terminal, verify its embedded server
 curl http://127.0.0.1:4444/status | jq
 
 # 6) initialise a second node
@@ -32,8 +34,8 @@ curl http://127.0.0.1:4444/status | jq
 # 7) save the first node as its peer
 ./target/debug/embernet --data ~/.embernet-test-2 peer-add ws://127.0.0.1:4444/sync
 
-# 8) open the terminal client; it discovers and syncs the channel
-./target/debug/embernet --data ~/.embernet-test-2 tui
+# 8) open the second terminal client; it discovers and syncs the channel
+./target/debug/embernet --data ~/.embernet-test-2 tui --listen 127.0.0.1:4445
 
 # 9) run as an MCP stdio server for AI clients
 ./target/debug/embernet --data ~/.embernet-test mcp
@@ -88,7 +90,7 @@ embernet sync             Pull messages from a remote peer via Have/Want
 embernet peer-add         Save a peer for automatic synchronization
 embernet peer-list        List saved peers
 embernet peer-remove      Remove a saved peer
-embernet tui              Open the interactive terminal client
+embernet tui              Open the terminal client, optionally accepting connections
 embernet mcp              Run as an MCP stdio server for AI clients
 ```
 
@@ -99,6 +101,7 @@ embernet mcp              Run as an MCP stdio server for AI clients
 - Optional local owner/moderator/writer ACLs gate channel appends.
 - File-backed — no external database required.
 - Saved peers provide remote channel discovery and periodic TUI synchronization.
+- The TUI can host the HTTP/WebSocket server with `--listen`.
 - AI-agent integration via MCP.
 
 ## Documentation

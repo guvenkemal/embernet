@@ -1,4 +1,5 @@
 use crate::proto::{Envelope, KeypairFile, Message};
+use crate::server;
 use crate::store::{self, ChannelRef, PolicyMode, append_message};
 use crate::sync;
 use crate::{peers, sync::PeerSyncSummary};
@@ -88,6 +89,7 @@ struct App {
     moderation_conflicts: usize,
     peers: Vec<String>,
     connection: String,
+    listener: String,
     local_fingerprint: Option<LocalStateFingerprint>,
     quit: bool,
 }
@@ -120,6 +122,7 @@ impl App {
             } else {
                 format!("connecting · {} peer(s)", peers.len())
             },
+            listener: "not listening".into(),
             peers,
             local_fingerprint: None,
             quit: false,
@@ -389,22 +392,65 @@ fn file_fingerprint(path: &Path) -> Result<Option<FileFingerprint>> {
     }
 }
 
-pub async fn run(datadir: PathBuf) -> Result<()> {
+pub async fn run(datadir: PathBuf, listen: Option<String>) -> Result<()> {
     let mut app = App::load(datadir)?;
+    let managed_server = match listen {
+        Some(listen) => {
+            let server = server::start(app.datadir.clone(), &listen)
+                .await
+                .with_context(|| format!("start TUI listener on {listen}"))?;
+            app.listener = format!("listening {}", server.local_addr());
+            Some(server)
+        }
+        None => None,
+    };
     let (sync_tx, mut sync_rx) = mpsc::unbounded_channel();
     let sync_task = tokio::spawn(auto_sync_worker(app.datadir.clone(), sync_tx));
-    enable_raw_mode()?;
+    if let Err(error) = enable_raw_mode() {
+        sync_task.abort();
+        if let Some(server) = managed_server {
+            let _ = server.shutdown().await;
+        }
+        return Err(error.into());
+    }
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+        sync_task.abort();
+        disable_raw_mode()?;
+        if let Some(server) = managed_server {
+            let _ = server.shutdown().await;
+        }
+        return Err(error.into());
+    }
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            sync_task.abort();
+            disable_raw_mode()?;
+            execute!(io::stdout(), LeaveAlternateScreen)?;
+            if let Some(server) = managed_server {
+                let _ = server.shutdown().await;
+            }
+            return Err(error.into());
+        }
+    };
 
     let result = run_loop(&mut terminal, &mut app, &mut sync_rx).await;
     sync_task.abort();
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result
+    let terminal_cleanup = (|| -> Result<()> {
+        disable_raw_mode()?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        terminal.show_cursor()?;
+        Ok(())
+    })();
+    let server_cleanup = match managed_server {
+        Some(server) => server.shutdown().await,
+        None => Ok(()),
+    };
+    result?;
+    terminal_cleanup?;
+    server_cleanup
 }
 
 async fn run_loop(
@@ -566,8 +612,8 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     };
     let text = match app.mode {
         InputMode::Normal => format!(
-            "{}{} · {}\n↑↓ channel  j/k scroll  p post  s sync  a audit  r refresh  q quit",
-            app.status, conflicts, app.connection
+            "{}{} · {} · {}\n↑↓ channel  j/k scroll  p post  s sync  a audit  r refresh  q quit",
+            app.status, conflicts, app.connection, app.listener
         ),
         InputMode::Post => format!("Post: {}\nEnter submit · Esc cancel", app.input),
         InputMode::Peer => format!("Peer: {}\nEnter sync · Esc cancel", app.input),
@@ -610,6 +656,7 @@ mod tests {
             moderation_conflicts: 0,
             peers: Vec::new(),
             connection: "offline · no saved peers".into(),
+            listener: "not listening".into(),
             local_fingerprint: None,
             quit: false,
         }
@@ -663,6 +710,7 @@ mod tests {
         assert!(rendered.contains("one"));
         assert!(rendered.contains("conflicts policy:1"));
         assert!(rendered.contains("p post"));
+        assert!(rendered.contains("not listening"));
     }
 
     #[test]

@@ -157,7 +157,11 @@ enum Commands {
     PeerRemove { url: String },
 
     /// Run the interactive terminal user interface
-    Tui,
+    Tui {
+        /// Also accept HTTP/WebSocket connections on this address
+        #[arg(long)]
+        listen: Option<String>,
+    },
 
     /// Sync messages from a remote peer via WebSocket Have/Want protocol
     Sync {
@@ -366,8 +370,8 @@ async fn main() -> Result<()> {
                 println!("peer not found: {}", peers::normalize_peer_url(&url)?);
             }
         }
-        Commands::Tui => {
-            tui::run(datadir).await?;
+        Commands::Tui { listen } => {
+            tui::run(datadir, listen).await?;
         }
         Commands::Sync { peer, channel } => {
             let received = sync::sync_from_peer(&datadir, &peer, &channel).await?;
@@ -469,5 +473,24 @@ mod cli_tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn tui_accepts_an_optional_listen_address() {
+        let cli = Cli::try_parse_from([
+            "embernet",
+            "--data",
+            "node",
+            "tui",
+            "--listen",
+            "127.0.0.1:4444",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Tui {
+                listen: Some(ref address)
+            } if address == "127.0.0.1:4444"
+        ));
     }
 }

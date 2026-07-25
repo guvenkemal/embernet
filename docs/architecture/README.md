@@ -40,6 +40,8 @@ terminal client
   -> GET /status discovers channels
   -> WebSocket /sync reconciles each discovered channel
   -> UI receives connection and timeline updates over an internal channel
+  -> optional managed HTTP/WebSocket listener shares the same data directory
+  -> terminal exit gracefully stops the listener
 ```
 
 Related: [[../protocol/protocol]]

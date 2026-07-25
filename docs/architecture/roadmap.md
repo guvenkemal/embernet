@@ -31,6 +31,7 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - Automatic TUI refresh for local server, CLI, MCP, and moderation writes ✅
 - Bottom-aware TUI follow-tail behavior for incoming messages ✅
 - Direct canonical identity generation during node initialization ✅
+- Integrated TUI listener with graceful server lifecycle ✅
 - next: private and encrypted channel support.
 - planned: Web UI client.
 
