@@ -149,7 +149,7 @@ impl App {
         };
         let chan = ChannelRef::parse(&channel)?;
         self.messages =
-            store::read_channel_tail_with_options(&self.datadir, &chan, 500, self.audit)?;
+            store::read_channel_tail_decrypted_with_options(&self.datadir, &chan, 500, self.audit)?;
         let policy = store::read_channel_policy(&self.datadir, &chan)?;
         self.visibility = match policy.visibility {
             ChannelVisibility::Public => "public".into(),
@@ -326,9 +326,10 @@ impl App {
             match action {
                 Action::Post(body) => {
                     self.follow_tail = true;
-                    let envelope = Envelope::sign(
+                    let envelope = store::sign_message_for_channel(
+                        &self.datadir,
+                        &chan,
                         self.identity.clone(),
-                        &channel,
                         Message::new_text(None, Vec::new(), body, Vec::new()),
                     )?;
                     let id = append_message(&self.datadir, &chan, &envelope)?;

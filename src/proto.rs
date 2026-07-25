@@ -70,7 +70,14 @@ pub struct Message {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum Body {
-    Text { text: String },
+    Text {
+        text: String,
+    },
+    Encrypted {
+        key_id: String,
+        nonce: String,
+        ciphertext: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +191,7 @@ impl Envelope {
     pub fn body_text(&self) -> Option<&str> {
         match &self.msg.body {
             Body::Text { text } => Some(text.as_str()),
+            Body::Encrypted { .. } => None,
         }
     }
 }

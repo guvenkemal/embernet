@@ -1,7 +1,8 @@
 # embernet (Phase 1)
 
 Decentralised coordination protocol with signed append-only logs,
-WebSocket Have/Want sync, and MCP AI-agent integration.
+end-to-end encrypted private channels, WebSocket Have/Want sync, and MCP
+AI-agent integration.
 
 ## Quickstart
 
@@ -62,6 +63,8 @@ to overwrite it during a later `init`.
   - `Envelope::verify()` checks both signature validity and id integrity.
 - **Storage** = append-only newline-delimited JSON (`.ndjson`) with a rebuildable per-channel ID index.
 - **Sync** = WebSocket `GET /sync` with Merkle-bucket reconciliation and bidirectional Have/Want.
+- **Private channels** = XChaCha20-Poly1305 encrypted message bodies with
+  authenticated member-to-member channel-key exchange.
 - **MCP** = stdio JSON-RPC server exposing `list_channels`, `tail_channel`, `post_message`.
 
 Full specification: `docs/protocol/protocol.md`
@@ -103,7 +106,8 @@ embernet mcp              Run as an MCP stdio server for AI clients
 - Offline-friendly, federated via store-and-forward.
 - Identity is **ed25519 keys** only. No wallets, tokens, or chains.
 - Signed, federated owner/moderator/writer policies gate channel appends.
-- Private visibility and reader membership restrict remote discovery and sync.
+- Private visibility and reader membership restrict remote discovery and sync;
+  private message bodies are encrypted before entering the append-only log.
 - File-backed — no external database required.
 - Saved peers provide remote channel discovery and periodic TUI synchronization.
 - The TUI can host the HTTP/WebSocket server with `--listen`.
@@ -124,11 +128,10 @@ embernet mcp              Run as an MCP stdio server for AI clients
 The timeline follows incoming messages while positioned at the bottom. Scrolling
 up disables follow-tail until the view returns to the bottom.
 
-### Private-channel foundation
+### Encrypted private channels
 
-Private visibility currently protects channel discovery and synchronization; it
-does not yet encrypt data stored on disk. To make a restricted channel visible
-only to its members:
+Private visibility protects discovery and synchronization and encrypts new message
+bodies end to end. To create one:
 
 ```bash
 ./target/debug/embernet --data ~/.embernet-test channel-create private/team
@@ -140,7 +143,19 @@ only to its members:
 ```
 
 Owners, moderators, writers, and readers can authenticate discovery and sync.
-Readers cannot post. Only the owner can change visibility.
+During sync, channel keys are wrapped to each member using X25519 keys derived from
+the existing Ed25519 identities. Readers cannot post. Only the owner can change
+visibility. Revoking any role rotates the write key, preventing that identity from
+decrypting later messages once remaining members synchronize the new key.
+
+Existing plaintext messages are not retroactively encrypted when a channel becomes
+private. Titles, tags, references, sender identities, and timestamps remain visible
+in envelope metadata. Treat `channel-keys.json` as sensitive: it is stored locally
+with owner-only permissions and is required to decrypt the ciphertext log.
+
+For a complete three-node walkthrough covering ciphertext verification, member
+access, non-member exclusion, and key rotation, see
+[Test the encrypted private-channel journey](docs/guides/encrypted-private-channel-test.md).
 
 ## Documentation
 
@@ -155,6 +170,7 @@ detail lives here — treat it as the authoritative source alongside the Rust so
 | [Protocol Specification](docs/protocol/protocol.md) | Envelope structure, signing/verification, `.ndjson` storage, Have/Want sync protocol, and current limitations. |
 | [MCP Interface](docs/protocol/mcp.md) | Tool definitions (`list_channels`, `tail_channel`, `post_message`), JSON-RPC examples, auth model, and error handling for AI agent integration. |
 | [Roadmap](docs/architecture/roadmap.md) | Phase 0 through Phase 2+ vision, current status, and architecture goals. |
+| [Encrypted private-channel test](docs/guides/encrypted-private-channel-test.md) | Alice/Bob/John end-to-end tutorial and manual release check. |
 | [Prior Art](docs/research/prior-art.md) | Comparisons with Nostr, Matrix, Scuttlebutt, IRC, Reddit, and Git — what we borrow and what we do differently. |
 | [ADR 001 — ndjson logs](docs/decisions/adr-001-log-storage.md) | Why we chose newline-delimited JSON over SQLite and binary formats for channel logs. |
 | [ADR Template](docs/decisions/adr-template.md) | How to write an Architecture Decision Record for this project. |
@@ -174,6 +190,8 @@ docs/
 ├── research/
 │   ├── README.md                      ← research index
 │   └── prior-art.md                   ← comparison with adjacent systems
+├── guides/
+│   └── encrypted-private-channel-test.md ← encrypted three-node test journey
 └── decisions/
     ├── README.md                      ← decision log index
     ├── adr-template.md                ← ADR template

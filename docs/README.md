@@ -16,6 +16,7 @@ Keep notes in plain Markdown so they stay readable in GitHub, terminals, and cod
 
 - `architecture/` — high-level diagrams, system flow notes, and module boundaries.
 - `protocol/` — wire formats, `Envelope` structure, Have/Want sync behavior, and storage formats.
+- `guides/` — copyable user journeys and manual release checks.
 - `research/` — prior art and design comparisons, including Nostr, Matrix, and Scuttlebutt.
 - `decisions/` — Architecture Decision Records (ADRs) for durable technical decisions.
 
@@ -27,3 +28,6 @@ Keep notes in plain Markdown so they stay readable in GitHub, terminals, and cod
 - Prefer examples that can be copied into tests or protocol fixtures.
 
 Start with [[protocol/protocol]] for the current wire protocol.
+
+To exercise public discovery, encrypted membership, and key rotation across three
+nodes, follow [[guides/encrypted-private-channel-test]].

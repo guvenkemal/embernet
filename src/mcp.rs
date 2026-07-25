@@ -1,5 +1,5 @@
 use crate::proto::{Envelope, KeypairFile, Message};
-use crate::store::{ChannelRef, append_message, read_channel_tail};
+use crate::store::{ChannelRef, append_message, read_channel_tail_decrypted};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -264,7 +264,7 @@ fn tail_channel(datadir: &Path, args: TailChannelArgs) -> Result<(String, Vec<En
     ensure_channel_log_exists(datadir, &chan)?;
     let identity = load_identity(datadir)?;
     crate::store::authorize_read(datadir, &chan, &identity.public_key)?;
-    let messages = read_channel_tail(datadir, &chan, args.limit)?;
+    let messages = read_channel_tail_decrypted(datadir, &chan, args.limit)?;
     Ok((chan.full_name, messages))
 }
 
@@ -274,7 +274,7 @@ fn post_message(datadir: &Path, args: PostMessageArgs) -> Result<Value> {
 
     let keypair = load_identity(datadir)?;
     let msg = Message::new_text(args.title, args.tags, args.body, args.refs);
-    let env = Envelope::sign(keypair, &chan.full_name, msg)?;
+    let env = crate::store::sign_message_for_channel(datadir, &chan, keypair, msg)?;
     let id = append_message(datadir, &chan, &env)?;
 
     Ok(json!({

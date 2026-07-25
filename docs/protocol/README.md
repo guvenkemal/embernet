@@ -6,6 +6,7 @@ Start here:
 
 - [[protocol]] — current Envelope and Have/Want sync specification.
 - [[mcp]] — MCP interface specification for AI agent integration.
+- [[../guides/encrypted-private-channel-test]] — three-node encrypted-channel test journey.
 
 Implementation references:
 

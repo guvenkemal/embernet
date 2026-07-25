@@ -55,8 +55,9 @@ their existing owner.
 Authorization is checked inside the locked storage append path after envelope
 verification. This applies equally to local CLI posts, MCP posts, and envelopes
 received through sync. Signed policy histories are reconciled before messages.
-Policies restrict writes and remote private-channel reads but do not encrypt
-channel data stored locally.
+Policies restrict writes and remote private-channel reads. New private-channel
+message bodies are encrypted before they enter the log; historical plaintext and
+envelope metadata are not retroactively encrypted.
 
 ## Channel names
 
@@ -114,6 +115,21 @@ Current body variants use Serde's internally tagged representation with `kind`:
 ```
 
 Note: the enum variant currently serializes as `"Text"`, not `"text"`.
+
+Private-channel text is stored and synchronized as:
+
+```json
+{
+  "kind": "Encrypted",
+  "key_id": "blake3-key-id-hex",
+  "nonce": "base64-xchacha-nonce",
+  "ciphertext": "base64-ciphertext"
+}
+```
+
+The body uses XChaCha20-Poly1305 with associated data
+`embernet-message-v1\n<channel>\n<key-id>`. The containing encrypted message is
+then hashed and signed normally.
 
 ## Envelope structure
 
@@ -219,7 +235,7 @@ The current sync protocol is implemented over WebSocket at:
 GET /sync
 ```
 
-Sync v6 reconciles one channel per connection. The opening packet authenticates
+Sync v7 reconciles one channel per connection. The opening packet authenticates
 the requester with a timestamped signature bound to the channel. Private channels
 reject non-members before returning policy or message data. Before message reconciliation, the
 initiator sends its complete signed policy history. Peers accept verified prefix
@@ -227,8 +243,11 @@ extensions; a fork is saved under `policy-conflicts/` and aborts message sync.
 
 After policy agreement, peers reconcile their signed moderation event chains using
 the same prefix-only rule. Valid forks are saved under `moderation-conflicts/` and
-also abort message sync. Only after both administrative histories agree does message
-bucket reconciliation begin.
+also abort message sync. For private channels, the authenticated members then
+exchange signed `key_sync` frames containing XChaCha20-Poly1305-wrapped channel
+keys. The wrapping key is derived with X25519 from each peer's existing Ed25519
+identity and is bound to the channel, key ID, sender, and recipient. Only after
+administrative histories and key exchange agree does message reconciliation begin.
 
 After policy agreement, IDs are grouped by their first byte
 into 256 buckets. Each bucket hash is BLAKE3 over its lexicographically sorted raw
@@ -239,7 +258,7 @@ into 256 buckets. Each bucket hash is BLAKE3 over its lexicographically sorted r
 ```json
 {
   "type": "status",
-  "version": 6,
+  "version": 7,
   "channel": "tech/linux",
   "requester": "ed25519-public-key-hex",
   "auth_ts": 1784990000,
@@ -255,7 +274,7 @@ Fields:
 | Field | Type | Description |
 | --- | --- | --- |
 | `type` | string | Must be `"status"`. |
-| `version` | integer | Must be `6`. |
+| `version` | integer | Must be `7`. |
 | `channel` | string | Channel to synchronize. |
 | `requester` | string | Ed25519 public key of the initiating node. |
 | `auth_ts` | integer | Unix timestamp, accepted within 60 seconds. |
@@ -303,12 +322,15 @@ so retrying a partially completed sync is safe.
 - A differing prefix bucket exchanges its complete ID list.
 - Differing inventories are capped at 100,000 IDs per peer and exchange.
 - One channel is reconciled per WebSocket connection.
-- Private data is not encrypted at rest; local data-directory access bypasses
-  remote membership controls.
-- Revoked members retain any plaintext data synchronized before revocation.
+- Private message bodies are ciphertext in the log, but local channel keys remain
+  sensitive and permit decryption.
+- Existing messages are not retroactively encrypted when visibility becomes private.
+- Envelope metadata (including sender, timestamp, title, tags, and references)
+  remains plaintext.
+- Revoked members retain data and historical keys synchronized before revocation.
 - Channel membership and visibility are visible to authorized peers in policy
   history.
-- Sync v5 peers are not wire-compatible with v6.
+- Sync v6 peers are not wire-compatible with v7.
 - Policy histories are sent in full before every exchange.
 - Moderation histories are sent in full before every exchange.
 - Historical messages are authorized against current policy state rather than the
@@ -316,3 +338,6 @@ so retrying a partially completed sync is safe.
 - `POST /sync` is not implemented in the current code; the active path is WebSocket `GET /sync`.
 
 These limitations should be considered candidates for future ADRs in [[../decisions/README]].
+
+The complete manual interoperability and encryption journey is documented in
+[[../guides/encrypted-private-channel-test]].

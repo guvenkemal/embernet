@@ -1,3 +1,4 @@
+mod crypto;
 mod mcp;
 mod peers;
 mod proto;
@@ -7,10 +8,10 @@ mod sync;
 mod tui;
 mod util;
 
-use crate::proto::{Envelope, KeypairFile, Message};
+use crate::proto::{KeypairFile, Message};
 use crate::store::{
     ChannelRef, ChannelVisibility, PolicyRole, append_message, init_layout,
-    read_channel_tail_with_options,
+    read_channel_tail_decrypted_with_options,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -360,7 +361,7 @@ async fn main() -> Result<()> {
             let chan = ChannelRef::parse(&channel)?;
             let kp = KeypairFile::load(&datadir.join("keys/identity.json"))?;
             let msg = Message::new_text(title, tags, body, refs);
-            let env = Envelope::sign(kp, &chan.full_name, msg)?;
+            let env = store::sign_message_for_channel(&datadir, &chan, kp, msg)?;
             let id = append_message(&datadir, &chan, &env)?;
             println!("posted {} -> {}", channel, id);
         }
@@ -372,7 +373,8 @@ async fn main() -> Result<()> {
             let chan = ChannelRef::parse(&channel)?;
             let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
             store::authorize_read(&datadir, &chan, &identity.public_key)?;
-            let msgs = read_channel_tail_with_options(&datadir, &chan, n, include_tombstoned)?;
+            let msgs =
+                read_channel_tail_decrypted_with_options(&datadir, &chan, n, include_tombstoned)?;
             for e in msgs {
                 println!(
                     "{} | {} | {}\n{}\n",

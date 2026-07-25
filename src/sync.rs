@@ -11,10 +11,11 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-const SYNC_VERSION: u32 = 6;
+const SYNC_VERSION: u32 = 7;
 const MAX_DIFFERING_IDS: usize = 100_000;
 const MAX_POLICY_EVENTS: usize = 10_000;
 const MAX_MODERATION_EVENTS: usize = 100_000;
+const MAX_KEY_OFFERS: usize = 4_096;
 const MAX_DISCOVERED_CHANNELS: usize = 10_000;
 const MAX_STATUS_BYTES: usize = 1_048_576;
 pub(crate) const DISCOVERY_KEY_HEADER: &str = "x-embernet-public-key";
@@ -61,6 +62,14 @@ struct ModerationSync {
     msg_type: String,
     status: String,
     events: Vec<store::ModerationEvent>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct KeySync {
+    #[serde(rename = "type")]
+    msg_type: String,
+    identity: String,
+    offers: Vec<crate::crypto::KeyOffer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +221,54 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
     })?))
     .await
     .context("send moderation sync")?;
+    let policy = store::read_channel_policy(datadir, &chan)?;
+    let server_identity = if policy.visibility == store::ChannelVisibility::Private {
+        let identity = KeypairFile::load(&datadir.join("keys/identity.json"))
+            .context("load server identity for private channel-key exchange")?;
+        if !store::policy_allows_read(&policy, &identity.public_key) {
+            bail!("serving identity is not a member of private channel");
+        }
+        Some(identity)
+    } else {
+        None
+    };
+    let offers = server_identity
+        .as_ref()
+        .map(|identity| {
+            crate::crypto::make_key_offers(datadir, &chan.full_name, identity, &status.requester)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    ws.send(Message::Text(serde_json::to_string(&KeySync {
+        msg_type: "key_sync".into(),
+        identity: server_identity
+            .as_ref()
+            .map(|identity| identity.public_key.clone())
+            .unwrap_or_default(),
+        offers,
+    })?))
+    .await
+    .context("send channel keys")?;
+    let key_sync = read_key_sync(&mut ws).await?;
+    if key_sync.identity != status.requester {
+        bail!("channel-key response identity does not match requester");
+    }
+    if policy.visibility == store::ChannelVisibility::Private
+        && !store::policy_allows_read(&policy, &key_sync.identity)
+    {
+        bail!("channel-key sender is not a channel member");
+    }
+    validate_key_offers(&key_sync)?;
+    if let Some(server_identity) = &server_identity {
+        crate::crypto::accept_key_offers(
+            datadir,
+            &chan.full_name,
+            server_identity,
+            &key_sync.offers,
+        )?;
+    } else if !key_sync.offers.is_empty() {
+        bail!("received channel keys for a public channel");
+    }
     let server_summaries = store::chunk_summaries(datadir, &chan)?;
     let client_hashes: std::collections::HashMap<u64, &str> = status
         .chunks
@@ -375,6 +432,37 @@ async fn read_chunk_batch(ws: &mut WebSocket) -> Result<ChunkBatch> {
     }
 }
 
+async fn read_key_sync(ws: &mut WebSocket) -> Result<KeySync> {
+    loop {
+        let msg = ws
+            .next()
+            .await
+            .context("peer closed before channel-key response")??;
+        if let Message::Text(text) = msg {
+            let sync: KeySync =
+                serde_json::from_str(&text).context("invalid channel-key response")?;
+            if sync.msg_type != "key_sync" {
+                bail!("expected type=key_sync");
+            }
+            return Ok(sync);
+        }
+    }
+}
+
+fn validate_key_offers(sync: &KeySync) -> Result<()> {
+    if sync.offers.len() > MAX_KEY_OFFERS {
+        bail!("channel-key exchange exceeds {MAX_KEY_OFFERS} offers");
+    }
+    if sync
+        .offers
+        .iter()
+        .any(|offer| offer.sender != sync.identity)
+    {
+        bail!("channel-key offer sender does not match peer identity");
+    }
+    Ok(())
+}
+
 pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Result<u64> {
     use tokio_tungstenite::connect_async;
 
@@ -451,6 +539,48 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
                 bail!("unexpected moderation sync status {}", moderation.status);
             }
             store::append_remote_moderation_history(datadir, &chan, &moderation.events)?;
+            continue;
+        }
+
+        if let Ok(key_sync) = serde_json::from_str::<KeySync>(&text)
+            && key_sync.msg_type == "key_sync"
+        {
+            validate_key_offers(&key_sync)?;
+            let policy = store::read_channel_policy(datadir, &chan)?;
+            if policy.visibility == store::ChannelVisibility::Private
+                && !store::policy_allows_read(&policy, &key_sync.identity)
+            {
+                bail!("channel-key sender is not a channel member");
+            }
+            if policy.visibility == store::ChannelVisibility::Private {
+                crate::crypto::accept_key_offers(
+                    datadir,
+                    &chan.full_name,
+                    &identity,
+                    &key_sync.offers,
+                )?;
+            } else if !key_sync.offers.is_empty() {
+                bail!("received channel keys for a public channel");
+            }
+            let offers = if policy.visibility == store::ChannelVisibility::Private {
+                crate::crypto::make_key_offers(
+                    datadir,
+                    &chan.full_name,
+                    &identity,
+                    &key_sync.identity,
+                )?
+            } else {
+                Vec::new()
+            };
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&KeySync {
+                    msg_type: "key_sync".into(),
+                    identity: identity.public_key.clone(),
+                    offers,
+                })?,
+            ))
+            .await
+            .context("send channel-key response")?;
             continue;
         }
 
@@ -593,7 +723,8 @@ mod tests {
     use crate::store::{
         ChannelVisibility, PolicyRole, create_channel, grant_role, init_layout,
         list_moderation_conflicts, list_policy_conflicts, message_ids, moderation_state,
-        read_policy_history, restrict_channel, set_channel_visibility, tombstone_message,
+        read_channel_tail_decrypted, read_policy_history, restrict_channel, set_channel_visibility,
+        sign_message_for_channel, tombstone_message,
     };
     use crate::util::channel_to_path;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -727,6 +858,7 @@ mod tests {
             init_layout(dir).unwrap();
         }
         let owner = KeypairFile::generate(Some("owner".into()));
+        owner.save(&server_dir.join("keys/identity.json")).unwrap();
         let member = ensure_identity(&member_dir);
         let outsider = ensure_identity(&outsider_dir);
         let chan = ChannelRef::parse("private/discuss").unwrap();
@@ -741,12 +873,17 @@ mod tests {
         )
         .unwrap();
         set_channel_visibility(&server_dir, &chan, &owner, ChannelVisibility::Private).unwrap();
-        let envelope = Envelope::sign(
+        let envelope = sign_message_for_channel(
+            &server_dir,
+            &chan,
             owner.clone(),
-            &chan.full_name,
             Message::new_text(None, vec![], "members only".into(), vec![]),
         )
         .unwrap();
+        assert!(matches!(
+            envelope.msg.body,
+            crate::proto::Body::Encrypted { .. }
+        ));
         append_message(&server_dir, &chan, &envelope).unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -768,7 +905,21 @@ mod tests {
         );
         let summary = sync_all_from_peer(&member_dir, &peer).await.unwrap();
         assert_eq!(summary.received, 1);
+        assert!(matches!(
+            store::read_message_by_id(&member_dir, &chan, &envelope.id)
+                .unwrap()
+                .msg
+                .body,
+            crate::proto::Body::Encrypted { .. }
+        ));
+        assert_eq!(
+            read_channel_tail_decrypted(&member_dir, &chan, 10).unwrap()[0].body_text(),
+            Some("members only")
+        );
 
+        let key_before_revoke = crate::crypto::current_channel_key(&server_dir, &chan.full_name)
+            .unwrap()
+            .id;
         store::revoke_role(
             &server_dir,
             &chan,
@@ -777,6 +928,12 @@ mod tests {
             &member.public_key,
         )
         .unwrap();
+        assert_ne!(
+            crate::crypto::current_channel_key(&server_dir, &chan.full_name)
+                .unwrap()
+                .id,
+            key_before_revoke
+        );
         assert!(
             discover_peer_channels(&member_dir, &peer)
                 .await

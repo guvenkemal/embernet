@@ -425,6 +425,12 @@ pub fn revoke_role(
     role: PolicyRole,
     public_key: &str,
 ) -> Result<ChannelPolicy> {
+    validate_public_key(public_key)?;
+    let current = read_channel_policy(base, chan)?;
+    authorize_policy_change(&current, &signer.public_key, role)?;
+    if current.visibility == ChannelVisibility::Private {
+        crate::crypto::generate_channel_key(base, &chan.full_name)?;
+    }
     append_policy_action(
         base,
         chan,
@@ -442,6 +448,14 @@ pub fn transfer_ownership(
     signer: &KeypairFile,
     new_owner: &str,
 ) -> Result<ChannelPolicy> {
+    validate_public_key(new_owner)?;
+    let current = read_channel_policy(base, chan)?;
+    if current.owner.as_deref() != Some(&signer.public_key) {
+        bail!("only the owner can transfer ownership");
+    }
+    if current.visibility == ChannelVisibility::Private {
+        crate::crypto::generate_channel_key(base, &chan.full_name)?;
+    }
     append_policy_action(
         base,
         chan,
@@ -458,12 +472,42 @@ pub fn set_channel_visibility(
     signer: &KeypairFile,
     visibility: ChannelVisibility,
 ) -> Result<ChannelPolicy> {
+    let current = read_channel_policy(base, chan)?;
+    if current.mode != PolicyMode::Restricted {
+        bail!("channel must be restricted before visibility can be changed");
+    }
+    if current.owner.as_deref() != Some(&signer.public_key) {
+        bail!("only the owner can change channel visibility");
+    }
+    if visibility == ChannelVisibility::Private {
+        crate::crypto::generate_channel_key(base, &chan.full_name)?;
+    }
     append_policy_action(
         base,
         chan,
         signer,
         PolicyAction::SetVisibility { visibility },
     )
+}
+
+pub fn sign_message_for_channel(
+    base: &Path,
+    chan: &ChannelRef,
+    signer: KeypairFile,
+    message: crate::proto::Message,
+) -> Result<Envelope> {
+    let policy = read_channel_policy(base, chan)?;
+    let message = if policy.visibility == ChannelVisibility::Private {
+        if crate::crypto::load_keys(base, &chan.full_name)?.is_empty()
+            && policy.owner.as_deref() == Some(&signer.public_key)
+        {
+            crate::crypto::generate_channel_key(base, &chan.full_name)?;
+        }
+        crate::crypto::encrypt_message(base, &chan.full_name, message)?
+    } else {
+        message
+    };
+    Envelope::sign(signer, &chan.full_name, message)
 }
 
 fn authorize_policy_change(policy: &ChannelPolicy, actor: &str, role: PolicyRole) -> Result<()> {
@@ -1353,8 +1397,29 @@ fn scan_verified_file(file: &mut std::fs::File, path: &Path) -> Result<Vec<Scann
     Ok(envelopes)
 }
 
+#[allow(dead_code)]
 pub fn read_channel_tail(base: &Path, chan: &ChannelRef, n: usize) -> Result<Vec<Envelope>> {
     read_channel_tail_with_options(base, chan, n, false)
+}
+
+pub fn read_channel_tail_decrypted(
+    base: &Path,
+    chan: &ChannelRef,
+    n: usize,
+) -> Result<Vec<Envelope>> {
+    read_channel_tail_decrypted_with_options(base, chan, n, false)
+}
+
+pub fn read_channel_tail_decrypted_with_options(
+    base: &Path,
+    chan: &ChannelRef,
+    n: usize,
+    include_tombstoned: bool,
+) -> Result<Vec<Envelope>> {
+    read_channel_tail_with_options(base, chan, n, include_tombstoned)?
+        .iter()
+        .map(|envelope| crate::crypto::decrypt_envelope(base, envelope))
+        .collect()
 }
 
 pub fn read_channel_tail_with_options(

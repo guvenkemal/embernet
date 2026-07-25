@@ -34,7 +34,8 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - Integrated TUI listener with graceful server lifecycle ✅
 - Signed private visibility, reader membership, and authenticated discovery ✅
 - Authenticated private-channel synchronization ✅
-- next: encrypt private-channel contents and rotate membership keys.
+- End-to-end encrypted private message bodies and membership-key rotation ✅
+- next: encrypt private message metadata and add explicit key recovery/export.
 - planned: Web UI client.
 
 ## Phase 2+ — Ecosystem
@@ -44,7 +45,7 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - WASM plugins and/or Lua scripting.
 - Full Web UI.
 - Federation with IPFS / Nostr / other networks (optional).
-- Private and encrypted channel support.
+- Rich encrypted-channel lifecycle and multi-device key recovery.
 
 ## Architecture goals
 
@@ -56,9 +57,11 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 
 ## Current status
 
-Phase 1 is active. Sync v6 authenticates the initiating identity, enforces private
+Phase 1 is active. Sync v7 authenticates the initiating identity, enforces private
 membership, and reconciles signed policy and moderation histories before
-using deterministic Merkle buckets to localize divergent messages. Saved peers let
+exchanging member-wrapped encryption keys and using deterministic Merkle buckets
+to localize divergent messages. Private message bodies use XChaCha20-Poly1305;
+X25519 exchange keys are derived from the existing Ed25519 identities. Saved peers let
 the terminal client discover channels and synchronize them periodically without
 blocking rendering or input. A lightweight local fingerprint also refreshes the
 selected timeline when another process writes to the same data directory. CLI,
