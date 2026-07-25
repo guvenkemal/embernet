@@ -34,10 +34,13 @@ curl http://127.0.0.1:4444/status | jq
 # 7) save the first node as its peer
 ./target/debug/embernet --data ~/.embernet-test-2 peer-add ws://127.0.0.1:4444/sync
 
-# 8) open the second terminal client; it discovers and syncs the channel
+# 8) save the second node on the first for symmetric reconnection
+./target/debug/embernet --data ~/.embernet-test peer-add ws://127.0.0.1:4445/sync
+
+# 9) open the second terminal client; it discovers and syncs the channel
 ./target/debug/embernet --data ~/.embernet-test-2 tui --listen 127.0.0.1:4445
 
-# 9) run as an MCP stdio server for AI clients
+# 10) run as an MCP stdio server for AI clients
 ./target/debug/embernet --data ~/.embernet-test mcp
 ```
 
@@ -86,7 +89,7 @@ embernet moderation-resolve Select a saved moderation head
 embernet post             Post a signed text message
 embernet tail             Tail recent messages from a channel
 embernet serve            Run HTTP/WebSocket server (status + sync)
-embernet sync             Pull messages from a remote peer via Have/Want
+embernet sync             Reconcile messages bidirectionally via Have/Want
 embernet peer-add         Save a peer for automatic synchronization
 embernet peer-list        List saved peers
 embernet peer-remove      Remove a saved peer
@@ -98,11 +101,26 @@ embernet mcp              Run as an MCP stdio server for AI clients
 
 - Offline-friendly, federated via store-and-forward.
 - Identity is **ed25519 keys** only. No wallets, tokens, or chains.
-- Optional local owner/moderator/writer ACLs gate channel appends.
+- Signed, federated owner/moderator/writer policies gate channel appends.
 - File-backed — no external database required.
 - Saved peers provide remote channel discovery and periodic TUI synchronization.
 - The TUI can host the HTTP/WebSocket server with `--listen`.
 - AI-agent integration via MCP.
+
+### TUI controls
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` | Select a channel |
+| `j` / `k` | Scroll down or up |
+| `p` | Compose a signed post |
+| `s` | Synchronize immediately and save the peer |
+| `a` | Toggle moderated/audit view |
+| `r` | Refresh local state |
+| `q` | Quit and stop the managed listener |
+
+The timeline follows incoming messages while positioned at the bottom. Scrolling
+up disables follow-tail until the view returns to the bottom.
 
 ## Documentation
 
@@ -139,7 +157,9 @@ docs/
 └── decisions/
     ├── README.md                      ← decision log index
     ├── adr-template.md                ← ADR template
-    └── adr-001-log-storage.md         ← why .ndjson for channel logs
+    ├── adr-001-log-storage.md         ← why .ndjson for channel logs
+    ├── ...                            ← protocol and storage decisions
+    └── adr-012-managed-tui-listener.md
 ```
 
 Open the vault in Obsidian: **`Open folder as vault` → select `docs/`**.
