@@ -33,6 +33,7 @@ remote sync
 terminal client
   -> shared channel discovery and storage APIs
   -> moderated or audit timeline
+  -> follow-tail scroll state advances only while the reader is at the bottom
   -> signed local post
   -> local metadata fingerprint every 500ms detects server, CLI, and MCP writes
   -> background worker reads peers.json every 3 seconds

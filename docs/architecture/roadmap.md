@@ -29,6 +29,7 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - First dedicated terminal client ✅
 - Persistent peers, channel discovery, and automatic TUI sync ✅
 - Automatic TUI refresh for local server, CLI, MCP, and moderation writes ✅
+- Bottom-aware TUI follow-tail behavior for incoming messages ✅
 - next: private and encrypted channel support.
 - planned: Web UI client.
 

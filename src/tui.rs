@@ -77,6 +77,8 @@ struct App {
     selected: usize,
     messages: Vec<Envelope>,
     scroll: u16,
+    max_scroll: u16,
+    follow_tail: bool,
     audit: bool,
     mode: InputMode,
     input: String,
@@ -104,6 +106,8 @@ impl App {
             selected: 0,
             messages: Vec::new(),
             scroll: 0,
+            max_scroll: 0,
+            follow_tail: true,
             audit: false,
             mode: InputMode::Normal,
             input: String::new(),
@@ -153,6 +157,7 @@ impl App {
         self.policy_conflicts = store::list_policy_conflicts(&self.datadir, &chan)?.len();
         self.moderation_conflicts = store::list_moderation_conflicts(&self.datadir, &chan)?.len();
         self.scroll = 0;
+        self.follow_tail = true;
         self.local_fingerprint = Some(self.local_state_fingerprint()?);
         Ok(())
     }
@@ -190,6 +195,7 @@ impl App {
 
         let selected = self.channel().map(str::to_owned);
         let scroll = self.scroll;
+        let follow_tail = self.follow_tail;
         self.channels = fingerprint.channels;
         self.selected = selected
             .and_then(|selected| {
@@ -200,6 +206,7 @@ impl App {
             .unwrap_or_else(|| self.selected.min(self.channels.len().saturating_sub(1)));
         self.refresh()?;
         self.scroll = scroll;
+        self.follow_tail = follow_tail;
         self.status = "local changes detected".into();
         Ok(true)
     }
@@ -251,8 +258,14 @@ impl App {
                     self.refresh()?;
                 }
             }
-            KeyCode::Char('k') | KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::Char('j') | KeyCode::PageDown => self.scroll = self.scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::PageUp => {
+                self.scroll = self.scroll.saturating_sub(1);
+                self.follow_tail = false;
+            }
+            KeyCode::Char('j') | KeyCode::PageDown => {
+                self.scroll = self.scroll.saturating_add(1).min(self.max_scroll);
+                self.follow_tail = self.scroll >= self.max_scroll;
+            }
             KeyCode::Char('a') => {
                 self.audit = !self.audit;
                 self.refresh()?;
@@ -294,6 +307,7 @@ impl App {
             let chan = ChannelRef::parse(&channel)?;
             match action {
                 Action::Post(body) => {
+                    self.follow_tail = true;
                     let envelope = Envelope::sign(
                         self.identity.clone(),
                         &channel,
@@ -337,6 +351,8 @@ impl App {
                     Ok(channels) => {
                         let channels_changed = channels != self.channels;
                         if channels_changed || summary.received > 0 {
+                            let scroll = self.scroll;
+                            let follow_tail = self.follow_tail;
                             self.channels = channels;
                             if let Some(selected) = selected
                                 && let Some(index) = self
@@ -348,6 +364,9 @@ impl App {
                             }
                             if let Err(error) = self.refresh() {
                                 self.status = format!("refresh failed: {error:#}");
+                            } else {
+                                self.scroll = scroll;
+                                self.follow_tail = follow_tail;
                             }
                         }
                     }
@@ -450,7 +469,7 @@ async fn auto_sync_worker(datadir: PathBuf, tx: mpsc::UnboundedSender<AutoSyncEv
     }
 }
 
-fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
+fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(8), Constraint::Length(4)])
@@ -482,7 +501,7 @@ fn render_channels(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_timeline(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+fn render_timeline(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
     let mut lines = Vec::new();
     for envelope in &app.messages {
         let time = chrono::DateTime::from_timestamp(envelope.ts, 0)
@@ -514,11 +533,30 @@ fn render_timeline(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         app.role,
         if app.audit { " · AUDIT" } else { "" }
     );
+    let content_width = area.width.saturating_sub(2);
+    let rendered_line_count = wrapped_line_count(&lines, content_width);
     let paragraph = Paragraph::new(Text::from(lines))
         .block(Block::default().title(title).borders(Borders::ALL))
-        .wrap(Wrap { trim: false })
-        .scroll((app.scroll, 0));
+        .wrap(Wrap { trim: false });
+    let visible_height = area.height.saturating_sub(2) as usize;
+    app.max_scroll = rendered_line_count
+        .saturating_sub(visible_height)
+        .min(u16::MAX as usize) as u16;
+    if app.follow_tail {
+        app.scroll = app.max_scroll;
+    } else {
+        app.scroll = app.scroll.min(app.max_scroll);
+    }
+    let paragraph = paragraph.scroll((app.scroll, 0));
     frame.render_widget(paragraph, area);
+}
+
+fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum()
 }
 
 fn render_footer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
@@ -561,6 +599,8 @@ mod tests {
             selected: 0,
             messages: Vec::new(),
             scroll: 0,
+            max_scroll: 0,
+            follow_tail: true,
             audit: false,
             mode: InputMode::Normal,
             input: String::new(),
@@ -615,10 +655,10 @@ mod tests {
 
     #[test]
     fn render_contains_channels_and_conflict_status() {
-        let app = test_app();
+        let mut app = test_app();
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &app)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("one"));
         assert!(rendered.contains("conflicts policy:1"));
@@ -644,6 +684,7 @@ mod tests {
         let (mut app, channel) = stored_app();
         assert!(!app.refresh_if_local_state_changed().unwrap());
         app.scroll = 7;
+        app.follow_tail = false;
 
         let envelope = Envelope::sign(
             KeypairFile::generate(Some("external".into())),
@@ -659,5 +700,53 @@ mod tests {
         assert_eq!(app.scroll, 7);
         assert_eq!(app.status, "local changes detected");
         assert!(!app.refresh_if_local_state_changed().unwrap());
+    }
+
+    #[test]
+    fn timeline_follows_new_messages_only_while_pinned_to_bottom() {
+        let (mut app, channel) = stored_app();
+        for index in 0..8 {
+            let envelope = Envelope::sign(
+                KeypairFile::generate(Some("external".into())),
+                &channel.full_name,
+                Message::new_text(None, Vec::new(), format!("message {index}"), Vec::new()),
+            )
+            .unwrap();
+            append_message(&app.datadir, &channel, &envelope).unwrap();
+        }
+        app.refresh().unwrap();
+
+        let backend = TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let original_bottom = app.scroll;
+        assert!(original_bottom > 0);
+        assert_eq!(app.scroll, app.max_scroll);
+
+        let newest = Envelope::sign(
+            KeypairFile::generate(Some("external".into())),
+            &channel.full_name,
+            Message::new_text(None, Vec::new(), "newest".into(), Vec::new()),
+        )
+        .unwrap();
+        append_message(&app.datadir, &channel, &newest).unwrap();
+        app.refresh_if_local_state_changed().unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.scroll > original_bottom);
+        assert_eq!(app.scroll, app.max_scroll);
+
+        app.handle_key(key(KeyCode::Char('k'))).unwrap();
+        let reading_position = app.scroll;
+        assert!(!app.follow_tail);
+        let later = Envelope::sign(
+            KeypairFile::generate(Some("external".into())),
+            &channel.full_name,
+            Message::new_text(None, Vec::new(), "later".into(), Vec::new()),
+        )
+        .unwrap();
+        append_message(&app.datadir, &channel, &later).unwrap();
+        app.refresh_if_local_state_changed().unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.scroll, reading_position);
     }
 }

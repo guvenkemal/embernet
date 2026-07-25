@@ -27,6 +27,10 @@ view only when that fingerprint changes. This covers writes received by a local
 server or performed by another CLI, MCP, or TUI process without requiring every
 writer to coordinate with the frontend.
 
+The timeline follows its calculated bottom as messages arrive. Scrolling upward
+disables follow-tail so incoming messages do not interrupt reading; returning to
+the bottom enables it again.
+
 ## Consequences
 
 - A saved peer is sufficient for channels and new messages to appear in the TUI.
@@ -34,6 +38,8 @@ writer to coordinate with the frontend.
 - Peer configuration changes are picked up without restarting the TUI.
 - Local changes appear without a manual refresh and unchanged polls do not reload
   the timeline.
+- Active conversations stay on the newest message without forcing readers who
+  scrolled upward back to the bottom.
 - Discovery currently reveals all channel names without authentication.
 - Each interval opens one HTTP request per peer and one WebSocket per channel.
 - Private channels will require a different, membership-aware discovery design.
