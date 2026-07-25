@@ -21,11 +21,19 @@ and runs the existing sync-v5 exchange for each channel. Results are sent to the
 rendering task over an internal channel so network work does not block keyboard
 input or drawing.
 
+The TUI also fingerprints the local channel list and selected channel's message,
+policy, moderation, and conflict metadata every 500 milliseconds. It reloads the
+view only when that fingerprint changes. This covers writes received by a local
+server or performed by another CLI, MCP, or TUI process without requiring every
+writer to coordinate with the frontend.
+
 ## Consequences
 
 - A saved peer is sufficient for channels and new messages to appear in the TUI.
 - Offline peers produce visible errors but do not stop the client.
 - Peer configuration changes are picked up without restarting the TUI.
+- Local changes appear without a manual refresh and unchanged polls do not reload
+  the timeline.
 - Discovery currently reveals all channel names without authentication.
 - Each interval opens one HTTP request per peer and one WebSocket per channel.
 - Private channels will require a different, membership-aware discovery design.

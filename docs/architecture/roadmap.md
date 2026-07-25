@@ -28,6 +28,7 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - Signed moderation events, federation, and filtered views ✅
 - First dedicated terminal client ✅
 - Persistent peers, channel discovery, and automatic TUI sync ✅
+- Automatic TUI refresh for local server, CLI, MCP, and moderation writes ✅
 - next: private and encrypted channel support.
 - planned: Web UI client.
 
@@ -53,7 +54,8 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 Phase 1 is active. Sync v5 reconciles signed policy and moderation histories before
 using deterministic Merkle buckets to localize divergent messages. Saved peers let
 the terminal client discover channels and synchronize them periodically without
-blocking rendering or input. CLI, MCP, and the terminal client all use the same
-protocol and storage core.
+blocking rendering or input. A lightweight local fingerprint also refreshes the
+selected timeline when another process writes to the same data directory. CLI,
+MCP, and the terminal client all use the same protocol and storage core.
 
 Related: [[../decisions/adr-001-log-storage]], [[../decisions/adr-template]]

@@ -14,12 +14,14 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use std::fs::Metadata;
 use std::io;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(3);
+const LOCAL_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
@@ -47,6 +49,27 @@ enum AutoSyncEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    length: u64,
+    modified: Option<SystemTime>,
+}
+
+impl From<Metadata> for FileFingerprint {
+    fn from(metadata: Metadata) -> Self {
+        Self {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalStateFingerprint {
+    channels: Vec<String>,
+    selected_files: Vec<Option<FileFingerprint>>,
+}
+
 struct App {
     datadir: PathBuf,
     identity: KeypairFile,
@@ -63,6 +86,7 @@ struct App {
     moderation_conflicts: usize,
     peers: Vec<String>,
     connection: String,
+    local_fingerprint: Option<LocalStateFingerprint>,
     quit: bool,
 }
 
@@ -93,6 +117,7 @@ impl App {
                 format!("connecting · {} peer(s)", peers.len())
             },
             peers,
+            local_fingerprint: None,
             quit: false,
         };
         app.refresh()?;
@@ -107,6 +132,7 @@ impl App {
         let Some(channel) = self.channel().map(str::to_owned) else {
             self.messages.clear();
             self.role = "-".into();
+            self.local_fingerprint = Some(self.local_state_fingerprint()?);
             return Ok(());
         };
         let chan = ChannelRef::parse(&channel)?;
@@ -127,7 +153,55 @@ impl App {
         self.policy_conflicts = store::list_policy_conflicts(&self.datadir, &chan)?.len();
         self.moderation_conflicts = store::list_moderation_conflicts(&self.datadir, &chan)?.len();
         self.scroll = 0;
+        self.local_fingerprint = Some(self.local_state_fingerprint()?);
         Ok(())
+    }
+
+    fn local_state_fingerprint(&self) -> Result<LocalStateFingerprint> {
+        let channels = store::list_channels(&self.datadir)?;
+        let selected_files = self
+            .channel()
+            .map(|channel| {
+                let channel_dir = crate::util::channel_to_path(&self.datadir, channel);
+                [
+                    channel_dir.join("log.ndjson"),
+                    channel_dir.join("policy.ndjson"),
+                    channel_dir.join("moderation.ndjson"),
+                    channel_dir.join("policy-conflicts"),
+                    channel_dir.join("moderation-conflicts"),
+                ]
+                .into_iter()
+                .map(|path| file_fingerprint(&path))
+                .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(LocalStateFingerprint {
+            channels,
+            selected_files,
+        })
+    }
+
+    fn refresh_if_local_state_changed(&mut self) -> Result<bool> {
+        let fingerprint = self.local_state_fingerprint()?;
+        if self.local_fingerprint.as_ref() == Some(&fingerprint) {
+            return Ok(false);
+        }
+
+        let selected = self.channel().map(str::to_owned);
+        let scroll = self.scroll;
+        self.channels = fingerprint.channels;
+        self.selected = selected
+            .and_then(|selected| {
+                self.channels
+                    .iter()
+                    .position(|channel| channel == &selected)
+            })
+            .unwrap_or_else(|| self.selected.min(self.channels.len().saturating_sub(1)));
+        self.refresh()?;
+        self.scroll = scroll;
+        self.status = "local changes detected".into();
+        Ok(true)
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<Action> {
@@ -288,6 +362,14 @@ impl App {
     }
 }
 
+fn file_fingerprint(path: &Path) -> Result<Option<FileFingerprint>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata.into())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read metadata {}", path.display())),
+    }
+}
+
 pub async fn run(datadir: PathBuf) -> Result<()> {
     let mut app = App::load(datadir)?;
     let (sync_tx, mut sync_rx) = mpsc::unbounded_channel();
@@ -311,9 +393,16 @@ async fn run_loop(
     app: &mut App,
     sync_rx: &mut mpsc::UnboundedReceiver<AutoSyncEvent>,
 ) -> Result<()> {
+    let mut last_local_refresh = Instant::now();
     while !app.quit {
         while let Ok(event) = sync_rx.try_recv() {
             app.apply_auto_sync(event);
+        }
+        if last_local_refresh.elapsed() >= LOCAL_REFRESH_INTERVAL {
+            if let Err(error) = app.refresh_if_local_state_changed() {
+                app.status = format!("local refresh failed: {error:#}");
+            }
+            last_local_refresh = Instant::now();
         }
         terminal.draw(|frame| render(frame, app))?;
         if event::poll(Duration::from_millis(100))?
@@ -456,6 +545,9 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -478,8 +570,23 @@ mod tests {
             moderation_conflicts: 0,
             peers: Vec::new(),
             connection: "offline · no saved peers".into(),
+            local_fingerprint: None,
             quit: false,
         }
+    }
+
+    fn stored_app() -> (App, ChannelRef) {
+        let datadir = std::env::temp_dir().join(format!(
+            "embernet_tui_refresh_test_{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&datadir);
+        store::init_layout(&datadir).unwrap();
+        let identity = KeypairFile::generate(Some("tester".into()));
+        identity.save(&datadir.join("keys/identity.json")).unwrap();
+        let channel = ChannelRef::parse("test/local-refresh").unwrap();
+        store::create_channel(&datadir, &channel).unwrap();
+        (App::load(datadir).unwrap(), channel)
     }
 
     #[test]
@@ -530,5 +637,27 @@ mod tests {
         });
         assert!(app.connection.starts_with("connected"));
         assert_eq!(app.status, "auto-sync: 2 channel(s), 0 received");
+    }
+
+    #[test]
+    fn local_refresh_detects_external_append_and_ignores_unchanged_state() {
+        let (mut app, channel) = stored_app();
+        assert!(!app.refresh_if_local_state_changed().unwrap());
+        app.scroll = 7;
+
+        let envelope = Envelope::sign(
+            KeypairFile::generate(Some("external".into())),
+            &channel.full_name,
+            Message::new_text(None, Vec::new(), "from server".into(), Vec::new()),
+        )
+        .unwrap();
+        append_message(&app.datadir, &channel, &envelope).unwrap();
+
+        assert!(app.refresh_if_local_state_changed().unwrap());
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].body_text(), Some("from server"));
+        assert_eq!(app.scroll, 7);
+        assert_eq!(app.status, "local changes detected");
+        assert!(!app.refresh_if_local_state_changed().unwrap());
     }
 }

@@ -34,6 +34,7 @@ terminal client
   -> shared channel discovery and storage APIs
   -> moderated or audit timeline
   -> signed local post
+  -> local metadata fingerprint every 500ms detects server, CLI, and MCP writes
   -> background worker reads peers.json every 3 seconds
   -> GET /status discovers channels
   -> WebSocket /sync reconciles each discovered channel
