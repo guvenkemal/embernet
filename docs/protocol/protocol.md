@@ -48,8 +48,8 @@ their existing owner.
 
 Authorization is checked inside the locked storage append path after envelope
 verification. This applies equally to local CLI posts, MCP posts, and envelopes
-received through sync. Policies are local node configuration: they are not sent by
-sync, do not restrict reads, and do not encrypt channel data.
+received through sync. Signed policy histories are reconciled before messages.
+Policies restrict writes but do not restrict reads or encrypt channel data.
 
 ## Channel names
 
@@ -186,6 +186,16 @@ Both checks must pass for `Envelope::verify()` to succeed — the signature must
 
 ## Have/Want sync protocol
 
+Peers expose their locally known channel names at:
+
+```text
+GET /status
+```
+
+The response contains `{"ok":true,"channels":[...]}`. Clients may use this list to
+create missing local channel shells before synchronizing. Discovery reveals
+channel names and is therefore not suitable for private-channel membership.
+
 The current sync protocol is implemented over WebSocket at:
 
 ```text
@@ -268,6 +278,7 @@ so retrying a partially completed sync is safe.
 - A differing prefix bucket exchanges its complete ID list.
 - Differing inventories are capped at 100,000 IDs per peer and exchange.
 - One channel is reconciled per WebSocket connection.
+- Channel discovery is unauthenticated and exposes all local channel names.
 - Sync v4 peers are not wire-compatible with v5.
 - Policy histories are sent in full before every exchange.
 - Moderation histories are sent in full before every exchange.

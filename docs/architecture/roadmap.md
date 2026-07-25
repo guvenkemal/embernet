@@ -27,6 +27,7 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - Prefix-only policy federation and explicit fork handling ✅
 - Signed moderation events, federation, and filtered views ✅
 - First dedicated terminal client ✅
+- Persistent peers, channel discovery, and automatic TUI sync ✅
 - next: private and encrypted channel support.
 - planned: Web UI client.
 
@@ -50,7 +51,9 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 ## Current status
 
 Phase 1 is active. Sync v5 reconciles signed policy and moderation histories before
-using deterministic Merkle buckets to localize divergent messages. CLI, MCP, and
-the interactive terminal client all use the same protocol and storage core.
+using deterministic Merkle buckets to localize divergent messages. Saved peers let
+the terminal client discover channels and synchronize them periodically without
+blocking rendering or input. CLI, MCP, and the terminal client all use the same
+protocol and storage core.
 
 Related: [[../decisions/adr-001-log-storage]], [[../decisions/adr-template]]

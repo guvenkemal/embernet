@@ -18,6 +18,7 @@ Start from [[adr-template]].
 - [[adr-008-prefix-only-policy-federation]] — Reconcile policy prefixes and quarantine forks.
 - [[adr-009-signed-moderation-overlay]] — Hide or restore messages without deleting envelopes.
 - [[adr-010-thin-terminal-client]] — Build the first frontend as a thin terminal client.
+- [[adr-011-persistent-peers-and-background-sync]] — Discover and periodically synchronize saved peers.
 
 ## Suggested ADRs
 

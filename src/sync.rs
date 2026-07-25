@@ -15,6 +15,20 @@ const SYNC_VERSION: u32 = 5;
 const MAX_DIFFERING_IDS: usize = 100_000;
 const MAX_POLICY_EVENTS: usize = 10_000;
 const MAX_MODERATION_EVENTS: usize = 100_000;
+const MAX_DISCOVERED_CHANNELS: usize = 10_000;
+const MAX_STATUS_BYTES: usize = 1_048_576;
+
+#[derive(Debug, Deserialize)]
+struct PeerStatus {
+    ok: bool,
+    channels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSyncSummary {
+    pub channels: usize,
+    pub received: u64,
+}
 
 #[derive(Debug, Deserialize)]
 struct StatusMessage {
@@ -464,6 +478,70 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
     Ok(received)
 }
 
+pub async fn discover_peer_channels(peer_url: &str) -> Result<Vec<String>> {
+    let mut status_url =
+        reqwest::Url::parse(peer_url).context("invalid peer URL for channel discovery")?;
+    let http_scheme = match status_url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        scheme => bail!("unsupported peer URL scheme {scheme}"),
+    };
+    status_url
+        .set_scheme(http_scheme)
+        .map_err(|_| anyhow::anyhow!("could not convert peer URL to HTTP"))?;
+    status_url.set_path("/status");
+    status_url.set_query(None);
+    status_url.set_fragment(None);
+
+    let response = reqwest::Client::new()
+        .get(status_url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .context("request peer status")?
+        .error_for_status()
+        .context("peer status returned an error")?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_STATUS_BYTES as u64)
+    {
+        bail!("peer status exceeds {MAX_STATUS_BYTES} bytes");
+    }
+    let body = response.bytes().await.context("read peer status")?;
+    if body.len() > MAX_STATUS_BYTES {
+        bail!("peer status exceeds {MAX_STATUS_BYTES} bytes");
+    }
+    let status: PeerStatus = serde_json::from_slice(&body).context("decode peer status")?;
+    if !status.ok {
+        bail!("peer reported an unhealthy status");
+    }
+    if status.channels.len() > MAX_DISCOVERED_CHANNELS {
+        bail!("peer advertises more than {MAX_DISCOVERED_CHANNELS} channels");
+    }
+    let mut channels = status
+        .channels
+        .into_iter()
+        .filter(|channel| ChannelRef::parse(channel).is_ok())
+        .collect::<Vec<_>>();
+    channels.sort();
+    channels.dedup();
+    Ok(channels)
+}
+
+pub async fn sync_all_from_peer(datadir: &Path, peer_url: &str) -> Result<PeerSyncSummary> {
+    let channels = discover_peer_channels(peer_url).await?;
+    let mut received = 0;
+    for channel in &channels {
+        let chan = ChannelRef::parse(channel)?;
+        store::create_channel(datadir, &chan)?;
+        received += sync_from_peer(datadir, peer_url, channel).await?;
+    }
+    Ok(PeerSyncSummary {
+        channels: channels.len(),
+        received,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +628,38 @@ mod tests {
                 .unwrap();
         retry_task.abort();
         assert_eq!(retry_received, 0);
+    }
+
+    #[tokio::test]
+    async fn discovers_nested_channels_and_syncs_without_local_creation() {
+        let server_dir = temp_dir("discovery_server");
+        let client_dir = temp_dir("discovery_client");
+        init_layout(&server_dir).unwrap();
+        init_layout(&client_dir).unwrap();
+        let chan = ChannelRef::parse("tech/discuss").unwrap();
+        create_channel(&server_dir, &chan).unwrap();
+        add_message(&server_dir, &chan, "discovered");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::server::router(server_dir);
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let peer = format!("ws://{addr}/sync");
+
+        assert_eq!(
+            discover_peer_channels(&peer).await.unwrap(),
+            vec!["tech/discuss"]
+        );
+        let summary = sync_all_from_peer(&client_dir, &peer).await.unwrap();
+        task.abort();
+
+        assert_eq!(summary.channels, 1);
+        assert_eq!(summary.received, 1);
+        assert_eq!(
+            store::list_channels(&client_dir).unwrap(),
+            vec!["tech/discuss"]
+        );
+        assert_eq!(message_ids(&client_dir, &chan).unwrap().len(), 1);
     }
 
     #[tokio::test]

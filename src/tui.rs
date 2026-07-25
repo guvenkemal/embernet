@@ -1,6 +1,7 @@
 use crate::proto::{Envelope, KeypairFile, Message};
 use crate::store::{self, ChannelRef, PolicyMode, append_message};
 use crate::sync;
+use crate::{peers, sync::PeerSyncSummary};
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::execute;
@@ -16,6 +17,9 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::sync::mpsc;
+
+const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
@@ -29,6 +33,18 @@ enum Action {
     None,
     Post(String),
     Sync(String),
+}
+
+#[derive(Debug)]
+enum AutoSyncEvent {
+    Complete {
+        peer: String,
+        summary: PeerSyncSummary,
+    },
+    Failed {
+        peer: String,
+        error: String,
+    },
 }
 
 struct App {
@@ -45,6 +61,8 @@ struct App {
     role: String,
     policy_conflicts: usize,
     moderation_conflicts: usize,
+    peers: Vec<String>,
+    connection: String,
     quit: bool,
 }
 
@@ -54,6 +72,7 @@ impl App {
         let identity = KeypairFile::load(&identity_path)
             .with_context(|| format!("load identity {}", identity_path.display()))?;
         let channels = store::list_channels(&datadir)?;
+        let peers = peers::list_peers(&datadir)?;
         let mut app = Self {
             datadir,
             identity,
@@ -68,6 +87,12 @@ impl App {
             role: "-".into(),
             policy_conflicts: 0,
             moderation_conflicts: 0,
+            connection: if peers.is_empty() {
+                "offline · no saved peers".into()
+            } else {
+                format!("connecting · {} peer(s)", peers.len())
+            },
+            peers,
             quit: false,
         };
         app.refresh()?;
@@ -169,7 +194,11 @@ impl App {
             }
             KeyCode::Char('s') if self.channel().is_some() => {
                 self.mode = InputMode::Peer;
-                self.input = "ws://127.0.0.1:4444/sync".into();
+                self.input = self
+                    .peers
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "ws://127.0.0.1:4444/sync".into());
             }
             KeyCode::Char('r') => {
                 self.channels = store::list_channels(&self.datadir)?;
@@ -200,7 +229,10 @@ impl App {
                     Ok(format!("posted {}", &id[..12]))
                 }
                 Action::Sync(peer) => {
+                    let peer = peers::add_peer(&self.datadir, &peer)?;
+                    self.peers = peers::list_peers(&self.datadir)?;
                     let received = sync::sync_from_peer(&self.datadir, &peer, &channel).await?;
+                    self.connection = format!("connected · {peer}");
                     Ok(format!("sync complete: {received} received"))
                 }
                 Action::None => unreachable!("no-op actions are handled before execution"),
@@ -217,17 +249,57 @@ impl App {
             Err(error) => self.status = format!("error: {error:#}"),
         }
     }
+
+    fn apply_auto_sync(&mut self, event: AutoSyncEvent) {
+        match event {
+            AutoSyncEvent::Complete { peer, summary } => {
+                self.connection = format!("connected · {peer}");
+                self.status = format!(
+                    "auto-sync: {} channel(s), {} received",
+                    summary.channels, summary.received
+                );
+                let selected = self.channel().map(str::to_owned);
+                match store::list_channels(&self.datadir) {
+                    Ok(channels) => {
+                        let channels_changed = channels != self.channels;
+                        if channels_changed || summary.received > 0 {
+                            self.channels = channels;
+                            if let Some(selected) = selected
+                                && let Some(index) = self
+                                    .channels
+                                    .iter()
+                                    .position(|channel| channel == &selected)
+                            {
+                                self.selected = index;
+                            }
+                            if let Err(error) = self.refresh() {
+                                self.status = format!("refresh failed: {error:#}");
+                            }
+                        }
+                    }
+                    Err(error) => self.status = format!("channel refresh failed: {error:#}"),
+                }
+            }
+            AutoSyncEvent::Failed { peer, error } => {
+                self.connection = format!("offline · {peer}");
+                self.status = format!("auto-sync error: {error}");
+            }
+        }
+    }
 }
 
 pub async fn run(datadir: PathBuf) -> Result<()> {
     let mut app = App::load(datadir)?;
+    let (sync_tx, mut sync_rx) = mpsc::unbounded_channel();
+    let sync_task = tokio::spawn(auto_sync_worker(app.datadir.clone(), sync_tx));
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &mut app).await;
+    let result = run_loop(&mut terminal, &mut app, &mut sync_rx).await;
+    sync_task.abort();
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -237,8 +309,12 @@ pub async fn run(datadir: PathBuf) -> Result<()> {
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
+    sync_rx: &mut mpsc::UnboundedReceiver<AutoSyncEvent>,
 ) -> Result<()> {
     while !app.quit {
+        while let Ok(event) = sync_rx.try_recv() {
+            app.apply_auto_sync(event);
+        }
         terminal.draw(|frame| render(frame, app))?;
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
@@ -251,6 +327,38 @@ async fn run_loop(
         }
     }
     Ok(())
+}
+
+async fn auto_sync_worker(datadir: PathBuf, tx: mpsc::UnboundedSender<AutoSyncEvent>) {
+    let mut interval = tokio::time::interval(AUTO_SYNC_INTERVAL);
+    loop {
+        interval.tick().await;
+        let configured = match peers::list_peers(&datadir) {
+            Ok(configured) => configured,
+            Err(error) => {
+                let _ = tx.send(AutoSyncEvent::Failed {
+                    peer: "configuration".into(),
+                    error: format!("{error:#}"),
+                });
+                continue;
+            }
+        };
+        for peer in configured {
+            let event = match sync::sync_all_from_peer(&datadir, &peer).await {
+                Ok(summary) => AutoSyncEvent::Complete {
+                    peer: peer.clone(),
+                    summary,
+                },
+                Err(error) => AutoSyncEvent::Failed {
+                    peer: peer.clone(),
+                    error: format!("{error:#}"),
+                },
+            };
+            if tx.send(event).is_err() {
+                return;
+            }
+        }
+    }
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
@@ -331,8 +439,8 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     };
     let text = match app.mode {
         InputMode::Normal => format!(
-            "{}{}\n↑↓ channel  j/k scroll  p post  s sync  a audit  r refresh  q quit",
-            app.status, conflicts
+            "{}{} · {}\n↑↓ channel  j/k scroll  p post  s sync  a audit  r refresh  q quit",
+            app.status, conflicts, app.connection
         ),
         InputMode::Post => format!("Post: {}\nEnter submit · Esc cancel", app.input),
         InputMode::Peer => format!("Peer: {}\nEnter sync · Esc cancel", app.input),
@@ -368,6 +476,8 @@ mod tests {
             role: "owner".into(),
             policy_conflicts: 1,
             moderation_conflicts: 0,
+            peers: Vec::new(),
+            connection: "offline · no saved peers".into(),
             quit: false,
         }
     }
@@ -406,5 +516,19 @@ mod tests {
         assert!(rendered.contains("one"));
         assert!(rendered.contains("conflicts policy:1"));
         assert!(rendered.contains("p post"));
+    }
+
+    #[test]
+    fn automatic_sync_updates_connection_status() {
+        let mut app = test_app();
+        app.apply_auto_sync(AutoSyncEvent::Complete {
+            peer: "ws://localhost:4444/sync".into(),
+            summary: PeerSyncSummary {
+                channels: 2,
+                received: 0,
+            },
+        });
+        assert!(app.connection.starts_with("connected"));
+        assert_eq!(app.status, "auto-sync: 2 channel(s), 0 received");
     }
 }

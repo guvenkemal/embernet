@@ -10,6 +10,7 @@ This folder contains high-level system diagrams, flow notes, and architectural s
 - File-backed append-only storage: `src/store.rs`
 - HTTP/WebSocket server: `src/server.rs`
 - Have/Want sync logic: `src/sync.rs`
+- Persistent peer configuration: `src/peers.rs`
 
 ## Core flow
 
@@ -32,7 +33,11 @@ remote sync
 terminal client
   -> shared channel discovery and storage APIs
   -> moderated or audit timeline
-  -> signed local post or WebSocket peer sync
+  -> signed local post
+  -> background worker reads peers.json every 3 seconds
+  -> GET /status discovers channels
+  -> WebSocket /sync reconciles each discovered channel
+  -> UI receives connection and timeline updates over an internal channel
 ```
 
 Related: [[../protocol/protocol]]

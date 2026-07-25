@@ -1,4 +1,5 @@
 mod mcp;
+mod peers;
 mod proto;
 mod server;
 mod store;
@@ -141,6 +142,15 @@ enum Commands {
 
     /// Run an MCP server over stdio for local AI clients
     Mcp,
+
+    /// Save a peer for automatic synchronization
+    PeerAdd { url: String },
+
+    /// List saved peers
+    PeerList,
+
+    /// Remove a saved peer
+    PeerRemove { url: String },
 
     /// Run the interactive terminal user interface
     Tui,
@@ -336,6 +346,23 @@ async fn main() -> Result<()> {
         }
         Commands::Mcp => {
             mcp::run_stdio(datadir)?;
+        }
+        Commands::PeerAdd { url } => {
+            let url = peers::add_peer(&datadir, &url)?;
+            println!("peer added: {url}");
+        }
+        Commands::PeerList => {
+            for peer in peers::list_peers(&datadir)? {
+                println!("{peer}");
+            }
+        }
+        Commands::PeerRemove { url } => {
+            let removed = peers::remove_peer(&datadir, &url)?;
+            if removed {
+                println!("peer removed: {}", peers::normalize_peer_url(&url)?);
+            } else {
+                println!("peer not found: {}", peers::normalize_peer_url(&url)?);
+            }
         }
         Commands::Tui => {
             tui::run(datadir).await?;
