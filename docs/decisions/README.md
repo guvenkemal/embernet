@@ -20,6 +20,7 @@ Start from [[adr-template]].
 - [[adr-010-thin-terminal-client]] — Build the first frontend as a thin terminal client.
 - [[adr-011-persistent-peers-and-background-sync]] — Discover and periodically synchronize saved peers.
 - [[adr-012-managed-tui-listener]] — Let the terminal client accept peer connections.
+- [[adr-013-private-channel-membership]] — Authenticate discovery and sync against signed membership.
 
 ## Suggested ADRs
 

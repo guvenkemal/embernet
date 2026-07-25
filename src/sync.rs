@@ -1,6 +1,6 @@
 //! Divergence-safe, bidirectional Have/Want sync over WebSocket.
 
-use crate::proto::Envelope;
+use crate::proto::{Envelope, KeypairFile, verify_bytes};
 use crate::server::AppState;
 use crate::store::{self, ChannelRef, append_message};
 use anyhow::{Context, Result, bail};
@@ -11,12 +11,15 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-const SYNC_VERSION: u32 = 5;
+const SYNC_VERSION: u32 = 6;
 const MAX_DIFFERING_IDS: usize = 100_000;
 const MAX_POLICY_EVENTS: usize = 10_000;
 const MAX_MODERATION_EVENTS: usize = 100_000;
 const MAX_DISCOVERED_CHANNELS: usize = 10_000;
 const MAX_STATUS_BYTES: usize = 1_048_576;
+pub(crate) const DISCOVERY_KEY_HEADER: &str = "x-embernet-public-key";
+pub(crate) const DISCOVERY_TIMESTAMP_HEADER: &str = "x-embernet-timestamp";
+pub(crate) const DISCOVERY_SIGNATURE_HEADER: &str = "x-embernet-signature";
 
 #[derive(Debug, Deserialize)]
 struct PeerStatus {
@@ -36,6 +39,9 @@ struct StatusMessage {
     msg_type: String,
     version: u32,
     channel: String,
+    requester: String,
+    auth_ts: i64,
+    auth_sig: String,
     policy_events: Vec<store::PolicyEvent>,
     moderation_events: Vec<store::ModerationEvent>,
     chunks: Vec<store::ChunkSummary>,
@@ -141,8 +147,24 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
         bail!("invalid chunk summary inventory");
     }
     let chan = ChannelRef::parse(&status.channel).context("invalid channel name in status")?;
+    if (chrono::Utc::now().timestamp() - status.auth_ts).abs() > 60 {
+        bail!("stale sync authentication");
+    }
+    verify_bytes(
+        &status.requester,
+        &status.auth_sig,
+        &sync_auth_payload(status.auth_ts, &status.channel),
+    )
+    .context("invalid sync authentication")?;
     store::validate_policy_history(&chan, &status.policy_events)?;
     let local_policy = store::read_policy_history(datadir, &chan)?;
+    let current_policy = store::read_channel_policy(datadir, &chan)?;
+    if !store::policy_allows_read(&current_policy, &status.requester) {
+        bail!(
+            "requester is not a member of private channel {}",
+            chan.full_name
+        );
+    }
     let local_prefix = is_policy_prefix(&local_policy, &status.policy_events);
     let remote_prefix = is_policy_prefix(&status.policy_events, &local_policy);
     if !local_prefix && !remote_prefix {
@@ -360,10 +382,17 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
     let local_chunks = store::chunk_summaries(datadir, &chan)?;
     let policy_events = store::read_policy_history(datadir, &chan)?;
     let moderation_events = store::read_moderation_history(datadir, &chan)?;
+    let identity = KeypairFile::load(&datadir.join("keys/identity.json"))
+        .context("load identity for synchronization")?;
+    let auth_ts = chrono::Utc::now().timestamp();
+    let auth_sig = identity.sign_bytes(&sync_auth_payload(auth_ts, channel))?;
     let status = serde_json::json!({
         "type": "status",
         "version": SYNC_VERSION,
         "channel": channel,
+        "requester": identity.public_key,
+        "auth_ts": auth_ts,
+        "auth_sig": auth_sig,
         "policy_events": policy_events,
         "moderation_events": moderation_events,
         "chunks": local_chunks,
@@ -478,7 +507,15 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
     Ok(received)
 }
 
-pub async fn discover_peer_channels(peer_url: &str) -> Result<Vec<String>> {
+fn sync_auth_payload(timestamp: i64, channel: &str) -> Vec<u8> {
+    format!("embernet-sync-auth-v1\n{timestamp}\n{channel}").into_bytes()
+}
+
+pub(crate) fn discovery_auth_payload(timestamp: i64) -> Vec<u8> {
+    format!("embernet-discovery-v1\n{timestamp}\n/status").into_bytes()
+}
+
+pub async fn discover_peer_channels(datadir: &Path, peer_url: &str) -> Result<Vec<String>> {
     let mut status_url =
         reqwest::Url::parse(peer_url).context("invalid peer URL for channel discovery")?;
     let http_scheme = match status_url.scheme() {
@@ -493,8 +530,15 @@ pub async fn discover_peer_channels(peer_url: &str) -> Result<Vec<String>> {
     status_url.set_query(None);
     status_url.set_fragment(None);
 
+    let identity = KeypairFile::load(&datadir.join("keys/identity.json"))
+        .context("load identity for channel discovery")?;
+    let timestamp = chrono::Utc::now().timestamp();
+    let signature = identity.sign_bytes(&discovery_auth_payload(timestamp))?;
     let response = reqwest::Client::new()
         .get(status_url)
+        .header(DISCOVERY_KEY_HEADER, &identity.public_key)
+        .header(DISCOVERY_TIMESTAMP_HEADER, timestamp.to_string())
+        .header(DISCOVERY_SIGNATURE_HEADER, signature)
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
@@ -529,7 +573,7 @@ pub async fn discover_peer_channels(peer_url: &str) -> Result<Vec<String>> {
 }
 
 pub async fn sync_all_from_peer(datadir: &Path, peer_url: &str) -> Result<PeerSyncSummary> {
-    let channels = discover_peer_channels(peer_url).await?;
+    let channels = discover_peer_channels(datadir, peer_url).await?;
     let mut received = 0;
     for channel in &channels {
         let chan = ChannelRef::parse(channel)?;
@@ -547,9 +591,9 @@ mod tests {
     use super::*;
     use crate::proto::{KeypairFile, Message};
     use crate::store::{
-        PolicyRole, create_channel, grant_role, init_layout, list_moderation_conflicts,
-        list_policy_conflicts, message_ids, moderation_state, read_policy_history,
-        restrict_channel, tombstone_message,
+        ChannelVisibility, PolicyRole, create_channel, grant_role, init_layout,
+        list_moderation_conflicts, list_policy_conflicts, message_ids, moderation_state,
+        read_policy_history, restrict_channel, set_channel_visibility, tombstone_message,
     };
     use crate::util::channel_to_path;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -575,6 +619,16 @@ mod tests {
         env.id
     }
 
+    fn ensure_identity(base: &Path) -> KeypairFile {
+        let identity_path = base.join("keys/identity.json");
+        if identity_path.exists() {
+            return KeypairFile::load(&identity_path).unwrap();
+        }
+        let identity = KeypairFile::generate(Some("sync test".into()));
+        identity.save(&identity_path).unwrap();
+        identity
+    }
+
     #[tokio::test]
     async fn equal_length_divergent_peers_converge() {
         let server_dir = temp_dir("server");
@@ -584,6 +638,7 @@ mod tests {
             init_layout(dir).unwrap();
             create_channel(dir, &chan).unwrap();
         }
+        ensure_identity(&client_dir);
         let server_id = add_message(&server_dir, &chan, "from server");
         let client_id = add_message(&client_dir, &chan, "from client");
 
@@ -636,18 +691,19 @@ mod tests {
         let client_dir = temp_dir("discovery_client");
         init_layout(&server_dir).unwrap();
         init_layout(&client_dir).unwrap();
+        ensure_identity(&client_dir);
         let chan = ChannelRef::parse("tech/discuss").unwrap();
         create_channel(&server_dir, &chan).unwrap();
         add_message(&server_dir, &chan, "discovered");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = crate::server::router(server_dir);
+        let app = crate::server::router(server_dir.clone());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let peer = format!("ws://{addr}/sync");
 
         assert_eq!(
-            discover_peer_channels(&peer).await.unwrap(),
+            discover_peer_channels(&client_dir, &peer).await.unwrap(),
             vec!["tech/discuss"]
         );
         let summary = sync_all_from_peer(&client_dir, &peer).await.unwrap();
@@ -663,6 +719,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_channels_are_discovered_and_synced_only_by_members() {
+        let server_dir = temp_dir("private_server");
+        let member_dir = temp_dir("private_member");
+        let outsider_dir = temp_dir("private_outsider");
+        for dir in [&server_dir, &member_dir, &outsider_dir] {
+            init_layout(dir).unwrap();
+        }
+        let owner = KeypairFile::generate(Some("owner".into()));
+        let member = ensure_identity(&member_dir);
+        let outsider = ensure_identity(&outsider_dir);
+        let chan = ChannelRef::parse("private/discuss").unwrap();
+        create_channel(&server_dir, &chan).unwrap();
+        restrict_channel(&server_dir, &chan, &owner).unwrap();
+        grant_role(
+            &server_dir,
+            &chan,
+            &owner,
+            PolicyRole::Reader,
+            &member.public_key,
+        )
+        .unwrap();
+        set_channel_visibility(&server_dir, &chan, &owner, ChannelVisibility::Private).unwrap();
+        let envelope = Envelope::sign(
+            owner.clone(),
+            &chan.full_name,
+            Message::new_text(None, vec![], "members only".into(), vec![]),
+        )
+        .unwrap();
+        append_message(&server_dir, &chan, &envelope).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::server::router(server_dir.clone());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let peer = format!("ws://{addr}/sync");
+        let anonymous: PeerStatus = reqwest::get(format!("http://{addr}/status"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(anonymous.channels.is_empty());
+
+        assert_eq!(
+            discover_peer_channels(&member_dir, &peer).await.unwrap(),
+            vec!["private/discuss"]
+        );
+        let summary = sync_all_from_peer(&member_dir, &peer).await.unwrap();
+        assert_eq!(summary.received, 1);
+
+        store::revoke_role(
+            &server_dir,
+            &chan,
+            &owner,
+            PolicyRole::Reader,
+            &member.public_key,
+        )
+        .unwrap();
+        assert!(
+            discover_peer_channels(&member_dir, &peer)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            sync_from_peer(&member_dir, &peer, &chan.full_name)
+                .await
+                .is_err()
+        );
+
+        assert!(
+            discover_peer_channels(&outsider_dir, &peer)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        create_channel(&outsider_dir, &chan).unwrap();
+        assert!(
+            sync_from_peer(&outsider_dir, &peer, &chan.full_name)
+                .await
+                .is_err()
+        );
+        assert_ne!(member.public_key, outsider.public_key);
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn restricted_server_rejects_unauthorized_upload() {
         let server_dir = temp_dir("acl_server");
         let client_dir = temp_dir("acl_client");
@@ -671,6 +814,7 @@ mod tests {
             init_layout(dir).unwrap();
             create_channel(dir, &chan).unwrap();
         }
+        ensure_identity(&client_dir);
         let owner = KeypairFile::generate(Some("owner".into()));
         restrict_channel(&server_dir, &chan, &owner).unwrap();
         add_message(&client_dir, &chan, "unauthorized");
@@ -694,6 +838,7 @@ mod tests {
     }
 
     async fn sync_once(server_dir: &Path, client_dir: &Path, chan: &ChannelRef) -> Result<u64> {
+        ensure_identity(client_dir);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let app = crate::server::router(server_dir.to_path_buf());

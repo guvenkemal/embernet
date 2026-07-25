@@ -78,9 +78,10 @@ embernet channel-policy-rebuild Rebuild the derived policy cache
 embernet channel-policy-conflicts List saved policy forks
 embernet channel-policy-resolve Select a saved policy head
 embernet channel-restrict Restrict writes and claim ownership with the local identity
-embernet channel-grant    Grant a moderator or writer role
-embernet channel-revoke   Revoke a moderator or writer role
+embernet channel-grant    Grant a moderator, writer, or reader role
+embernet channel-revoke   Revoke a moderator, writer, or reader role
 embernet channel-transfer-owner Transfer ownership to another public key
+embernet channel-visibility Set signed public/private discovery visibility
 embernet moderate-tombstone Tombstone a message from normal views
 embernet moderate-restore Restore a tombstoned message
 embernet moderation-history Show signed moderation events
@@ -102,6 +103,7 @@ embernet mcp              Run as an MCP stdio server for AI clients
 - Offline-friendly, federated via store-and-forward.
 - Identity is **ed25519 keys** only. No wallets, tokens, or chains.
 - Signed, federated owner/moderator/writer policies gate channel appends.
+- Private visibility and reader membership restrict remote discovery and sync.
 - File-backed — no external database required.
 - Saved peers provide remote channel discovery and periodic TUI synchronization.
 - The TUI can host the HTTP/WebSocket server with `--listen`.
@@ -121,6 +123,24 @@ embernet mcp              Run as an MCP stdio server for AI clients
 
 The timeline follows incoming messages while positioned at the bottom. Scrolling
 up disables follow-tail until the view returns to the bottom.
+
+### Private-channel foundation
+
+Private visibility currently protects channel discovery and synchronization; it
+does not yet encrypt data stored on disk. To make a restricted channel visible
+only to its members:
+
+```bash
+./target/debug/embernet --data ~/.embernet-test channel-create private/team
+./target/debug/embernet --data ~/.embernet-test channel-restrict private/team
+./target/debug/embernet --data ~/.embernet-test \
+  channel-grant private/team reader <member-public-key>
+./target/debug/embernet --data ~/.embernet-test \
+  channel-visibility private/team private
+```
+
+Owners, moderators, writers, and readers can authenticate discovery and sync.
+Readers cannot post. Only the owner can change visibility.
 
 ## Documentation
 

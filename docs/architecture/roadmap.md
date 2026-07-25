@@ -32,7 +32,9 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - Bottom-aware TUI follow-tail behavior for incoming messages ✅
 - Direct canonical identity generation during node initialization ✅
 - Integrated TUI listener with graceful server lifecycle ✅
-- next: private and encrypted channel support.
+- Signed private visibility, reader membership, and authenticated discovery ✅
+- Authenticated private-channel synchronization ✅
+- next: encrypt private-channel contents and rotate membership keys.
 - planned: Web UI client.
 
 ## Phase 2+ — Ecosystem
@@ -54,7 +56,8 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 
 ## Current status
 
-Phase 1 is active. Sync v5 reconciles signed policy and moderation histories before
+Phase 1 is active. Sync v6 authenticates the initiating identity, enforces private
+membership, and reconciles signed policy and moderation histories before
 using deterministic Merkle buckets to localize divergent messages. Saved peers let
 the terminal client discover channels and synchronize them periodically without
 blocking rendering or input. A lightweight local fingerprint also refreshes the

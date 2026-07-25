@@ -1,7 +1,13 @@
+use crate::proto::verify_bytes;
 use crate::sync;
 use anyhow::{Context, Result};
 use axum::{
-    Router, extract::State, extract::ws::WebSocketUpgrade, response::IntoResponse, routing::get,
+    Json, Router,
+    extract::State,
+    extract::ws::WebSocketUpgrade,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::get,
 };
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -79,12 +85,46 @@ pub(crate) fn router(datadir: PathBuf) -> Router {
         .with_state(Arc::new(state))
 }
 
-async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let list = crate::store::list_channels(&state.datadir).unwrap_or_default();
-    axum::Json(Status {
+async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let requester = match discovery_requester(&headers) {
+        Ok(requester) => requester,
+        Err(error) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let list = crate::store::list_readable_channels(&state.datadir, requester.as_deref())
+        .unwrap_or_default();
+    Json(Status {
         ok: true,
         channels: list,
     })
+    .into_response()
+}
+
+fn discovery_requester(headers: &HeaderMap) -> Result<Option<String>> {
+    let key = headers.get(sync::DISCOVERY_KEY_HEADER);
+    let timestamp = headers.get(sync::DISCOVERY_TIMESTAMP_HEADER);
+    let signature = headers.get(sync::DISCOVERY_SIGNATURE_HEADER);
+    if key.is_none() && timestamp.is_none() && signature.is_none() {
+        return Ok(None);
+    }
+    let key = key.context("missing discovery public key")?.to_str()?;
+    let timestamp: i64 = timestamp
+        .context("missing discovery timestamp")?
+        .to_str()?
+        .parse()
+        .context("invalid discovery timestamp")?;
+    let signature = signature.context("missing discovery signature")?.to_str()?;
+    if (chrono::Utc::now().timestamp() - timestamp).abs() > 60 {
+        anyhow::bail!("stale discovery signature");
+    }
+    verify_bytes(key, signature, &sync::discovery_auth_payload(timestamp))
+        .context("invalid discovery signature")?;
+    Ok(Some(key.to_string()))
 }
 
 /// Upgrade HTTP GET to WebSocket and hand off to the sync protocol handler.

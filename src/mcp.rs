@@ -255,12 +255,15 @@ fn parse_args<T: for<'de> Deserialize<'de>>(value: Value) -> std::result::Result
 }
 
 fn list_channels(datadir: &Path) -> Result<Vec<String>> {
-    crate::store::list_channels(datadir)
+    let identity = load_identity(datadir)?;
+    crate::store::list_readable_channels(datadir, Some(&identity.public_key))
 }
 
 fn tail_channel(datadir: &Path, args: TailChannelArgs) -> Result<(String, Vec<Envelope>)> {
     let chan = ChannelRef::parse(&args.channel)?;
     ensure_channel_log_exists(datadir, &chan)?;
+    let identity = load_identity(datadir)?;
+    crate::store::authorize_read(datadir, &chan, &identity.public_key)?;
     let messages = read_channel_tail(datadir, &chan, args.limit)?;
     Ok((chan.full_name, messages))
 }
@@ -269,13 +272,7 @@ fn post_message(datadir: &Path, args: PostMessageArgs) -> Result<Value> {
     let chan = ChannelRef::parse(&args.channel)?;
     ensure_channel_log_exists(datadir, &chan)?;
 
-    let identity_path = datadir.join("keys/identity.json");
-    let keypair = KeypairFile::load(&identity_path).with_context(|| {
-        format!(
-            "failed to load identity keypair at {}",
-            identity_path.display()
-        )
-    })?;
+    let keypair = load_identity(datadir)?;
     let msg = Message::new_text(args.title, args.tags, args.body, args.refs);
     let env = Envelope::sign(keypair, &chan.full_name, msg)?;
     let id = append_message(datadir, &chan, &env)?;
@@ -285,6 +282,16 @@ fn post_message(datadir: &Path, args: PostMessageArgs) -> Result<Value> {
         "channel": chan.full_name,
         "envelope": env
     }))
+}
+
+fn load_identity(datadir: &Path) -> Result<KeypairFile> {
+    let identity_path = datadir.join("keys/identity.json");
+    KeypairFile::load(&identity_path).with_context(|| {
+        format!(
+            "failed to load identity keypair at {}",
+            identity_path.display()
+        )
+    })
 }
 
 fn ensure_channel_log_exists(datadir: &Path, chan: &ChannelRef) -> Result<()> {

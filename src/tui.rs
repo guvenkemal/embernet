@@ -1,6 +1,8 @@
 use crate::proto::{Envelope, KeypairFile, Message};
 use crate::server;
-use crate::store::{self, ChannelRef, PolicyMode, append_message};
+use crate::store::{
+    self, ChannelRef, ChannelVisibility, PolicyMode, append_message, policy_allows_read,
+};
 use crate::sync;
 use crate::{peers, sync::PeerSyncSummary};
 use anyhow::{Context, Result};
@@ -85,6 +87,7 @@ struct App {
     input: String,
     status: String,
     role: String,
+    visibility: String,
     policy_conflicts: usize,
     moderation_conflicts: usize,
     peers: Vec<String>,
@@ -99,8 +102,8 @@ impl App {
         let identity_path = datadir.join("keys/identity.json");
         let identity = KeypairFile::load(&identity_path)
             .with_context(|| format!("load identity {}", identity_path.display()))?;
-        let channels = store::list_channels(&datadir)?;
         let peers = peers::list_peers(&datadir)?;
+        let channels = store::list_readable_channels(&datadir, Some(&identity.public_key))?;
         let mut app = Self {
             datadir,
             identity,
@@ -115,6 +118,7 @@ impl App {
             input: String::new(),
             status: "ready".into(),
             role: "-".into(),
+            visibility: "-".into(),
             policy_conflicts: 0,
             moderation_conflicts: 0,
             connection: if peers.is_empty() {
@@ -139,6 +143,7 @@ impl App {
         let Some(channel) = self.channel().map(str::to_owned) else {
             self.messages.clear();
             self.role = "-".into();
+            self.visibility = "-".into();
             self.local_fingerprint = Some(self.local_state_fingerprint()?);
             return Ok(());
         };
@@ -146,6 +151,10 @@ impl App {
         self.messages =
             store::read_channel_tail_with_options(&self.datadir, &chan, 500, self.audit)?;
         let policy = store::read_channel_policy(&self.datadir, &chan)?;
+        self.visibility = match policy.visibility {
+            ChannelVisibility::Public => "public".into(),
+            ChannelVisibility::Private => "private".into(),
+        };
         self.role = if policy.mode == PolicyMode::Open {
             "open writer".into()
         } else if policy.owner.as_deref() == Some(&self.identity.public_key) {
@@ -154,6 +163,10 @@ impl App {
             "moderator".into()
         } else if policy.writers.contains(&self.identity.public_key) {
             "writer".into()
+        } else if policy.readers.contains(&self.identity.public_key) {
+            "reader".into()
+        } else if !policy_allows_read(&policy, &self.identity.public_key) {
+            "non-member".into()
         } else {
             "reader".into()
         };
@@ -166,7 +179,8 @@ impl App {
     }
 
     fn local_state_fingerprint(&self) -> Result<LocalStateFingerprint> {
-        let channels = store::list_channels(&self.datadir)?;
+        let channels =
+            store::list_readable_channels(&self.datadir, Some(&self.identity.public_key))?;
         let selected_files = self
             .channel()
             .map(|channel| {
@@ -291,7 +305,8 @@ impl App {
                     .unwrap_or_else(|| "ws://127.0.0.1:4444/sync".into());
             }
             KeyCode::Char('r') => {
-                self.channels = store::list_channels(&self.datadir)?;
+                self.channels =
+                    store::list_readable_channels(&self.datadir, Some(&self.identity.public_key))?;
                 self.selected = self.selected.min(self.channels.len().saturating_sub(1));
                 self.refresh()?;
                 self.status = "refreshed".into();
@@ -350,7 +365,8 @@ impl App {
                     summary.channels, summary.received
                 );
                 let selected = self.channel().map(str::to_owned);
-                match store::list_channels(&self.datadir) {
+                match store::list_readable_channels(&self.datadir, Some(&self.identity.public_key))
+                {
                     Ok(channels) => {
                         let channels_changed = channels != self.channels;
                         if channels_changed || summary.received > 0 {
@@ -574,8 +590,9 @@ fn render_timeline(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
         lines.push(Line::raw(""));
     }
     let title = format!(
-        " {} · {}{} ",
+        " {} · {} · {}{} ",
         app.channel().unwrap_or("No channel"),
+        app.visibility,
         app.role,
         if app.audit { " · AUDIT" } else { "" }
     );
@@ -652,6 +669,7 @@ mod tests {
             input: String::new(),
             status: "ready".into(),
             role: "owner".into(),
+            visibility: "private".into(),
             policy_conflicts: 1,
             moderation_conflicts: 0,
             peers: Vec::new(),

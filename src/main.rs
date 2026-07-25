@@ -9,7 +9,8 @@ mod util;
 
 use crate::proto::{Envelope, KeypairFile, Message};
 use crate::store::{
-    ChannelRef, PolicyRole, append_message, init_layout, read_channel_tail_with_options,
+    ChannelRef, ChannelVisibility, PolicyRole, append_message, init_layout,
+    read_channel_tail_with_options,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -75,14 +76,14 @@ enum Commands {
     /// Restrict channel writes and make the local identity its owner
     ChannelRestrict { channel: String },
 
-    /// Grant a moderator or writer role by Ed25519 public key
+    /// Grant a moderator, writer, or reader role by Ed25519 public key
     ChannelGrant {
         channel: String,
         role: RoleArg,
         public_key: String,
     },
 
-    /// Revoke a moderator or writer role by Ed25519 public key
+    /// Revoke a moderator, writer, or reader role by Ed25519 public key
     ChannelRevoke {
         channel: String,
         role: RoleArg,
@@ -91,6 +92,12 @@ enum Commands {
 
     /// Transfer channel ownership to an Ed25519 public key
     ChannelTransferOwner { channel: String, public_key: String },
+
+    /// Set a restricted channel's discovery visibility
+    ChannelVisibility {
+        channel: String,
+        visibility: VisibilityArg,
+    },
 
     /// Tombstone a message in normal channel views
     ModerateTombstone {
@@ -177,6 +184,7 @@ enum Commands {
 enum RoleArg {
     Moderator,
     Writer,
+    Reader,
 }
 
 impl From<RoleArg> for PolicyRole {
@@ -184,6 +192,22 @@ impl From<RoleArg> for PolicyRole {
         match role {
             RoleArg::Moderator => Self::Moderator,
             RoleArg::Writer => Self::Writer,
+            RoleArg::Reader => Self::Reader,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum VisibilityArg {
+    Public,
+    Private,
+}
+
+impl From<VisibilityArg> for ChannelVisibility {
+    fn from(visibility: VisibilityArg) -> Self {
+        match visibility {
+            VisibilityArg::Public => Self::Public,
+            VisibilityArg::Private => Self::Private,
         }
     }
 }
@@ -279,6 +303,16 @@ async fn main() -> Result<()> {
             let policy = store::transfer_ownership(&datadir, &chan, &identity, &public_key)?;
             println!("{}", serde_json::to_string_pretty(&policy)?);
         }
+        Commands::ChannelVisibility {
+            channel,
+            visibility,
+        } => {
+            let chan = ChannelRef::parse(&channel)?;
+            let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
+            let policy =
+                store::set_channel_visibility(&datadir, &chan, &identity, visibility.into())?;
+            println!("{}", serde_json::to_string_pretty(&policy)?);
+        }
         Commands::ModerateTombstone {
             channel,
             message_id,
@@ -336,6 +370,8 @@ async fn main() -> Result<()> {
             include_tombstoned,
         } => {
             let chan = ChannelRef::parse(&channel)?;
+            let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
+            store::authorize_read(&datadir, &chan, &identity.public_key)?;
             let msgs = read_channel_tail_with_options(&datadir, &chan, n, include_tombstoned)?;
             for e in msgs {
                 println!(

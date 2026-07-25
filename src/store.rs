@@ -32,13 +32,25 @@ pub enum PolicyMode {
     Restricted,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelVisibility {
+    #[default]
+    Public,
+    Private,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChannelPolicy {
     pub version: u32,
     pub mode: PolicyMode,
+    #[serde(default)]
+    pub visibility: ChannelVisibility,
     pub owner: Option<String>,
     pub moderators: Vec<String>,
     pub writers: Vec<String>,
+    #[serde(default)]
+    pub readers: Vec<String>,
 }
 
 impl Default for ChannelPolicy {
@@ -46,9 +58,11 @@ impl Default for ChannelPolicy {
         Self {
             version: 1,
             mode: PolicyMode::Open,
+            visibility: ChannelVisibility::Public,
             owner: None,
             moderators: Vec::new(),
             writers: Vec::new(),
+            readers: Vec::new(),
         }
     }
 }
@@ -58,6 +72,7 @@ impl Default for ChannelPolicy {
 pub enum PolicyRole {
     Moderator,
     Writer,
+    Reader,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +94,9 @@ pub enum PolicyAction {
     },
     TransferOwner {
         new_owner: String,
+    },
+    SetVisibility {
+        visibility: ChannelVisibility,
     },
 }
 
@@ -193,6 +211,29 @@ pub fn list_channels(base: &Path) -> Result<Vec<String>> {
     Ok(channels)
 }
 
+pub fn list_readable_channels(base: &Path, public_key: Option<&str>) -> Result<Vec<String>> {
+    list_channels(base)?
+        .into_iter()
+        .filter_map(|name| {
+            let chan = match ChannelRef::parse(&name) {
+                Ok(chan) => chan,
+                Err(error) => return Some(Err(error)),
+            };
+            match read_channel_policy(base, &chan) {
+                Ok(policy)
+                    if public_key
+                        .map(|key| policy_allows_read(&policy, key))
+                        .unwrap_or(policy.visibility == ChannelVisibility::Public) =>
+                {
+                    Some(Ok(name))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
+}
+
 fn collect_channels(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
         let entry = entry?;
@@ -295,10 +336,37 @@ pub fn read_channel_policy(base: &Path, chan: &ChannelRef) -> Result<ChannelPoli
     if let Some(owner) = &policy.owner {
         validate_public_key(owner)?;
     }
-    for key in policy.moderators.iter().chain(&policy.writers) {
+    for key in policy
+        .moderators
+        .iter()
+        .chain(&policy.writers)
+        .chain(&policy.readers)
+    {
         validate_public_key(key)?;
     }
+    if policy.visibility == ChannelVisibility::Private && policy.mode != PolicyMode::Restricted {
+        bail!("private channel policy must be restricted");
+    }
     Ok(policy)
+}
+
+pub fn policy_allows_read(policy: &ChannelPolicy, public_key: &str) -> bool {
+    policy.visibility == ChannelVisibility::Public
+        || policy.owner.as_deref() == Some(public_key)
+        || policy.moderators.iter().any(|key| key == public_key)
+        || policy.writers.iter().any(|key| key == public_key)
+        || policy.readers.iter().any(|key| key == public_key)
+}
+
+pub fn authorize_read(base: &Path, chan: &ChannelRef, public_key: &str) -> Result<()> {
+    if policy_allows_read(&read_channel_policy(base, chan)?, public_key) {
+        return Ok(());
+    }
+    bail!(
+        "identity {} is not allowed to read private channel {}",
+        public_key,
+        chan.full_name
+    )
 }
 
 fn authorize_append(base: &Path, chan: &ChannelRef, author: &str) -> Result<()> {
@@ -384,6 +452,20 @@ pub fn transfer_ownership(
     )
 }
 
+pub fn set_channel_visibility(
+    base: &Path,
+    chan: &ChannelRef,
+    signer: &KeypairFile,
+    visibility: ChannelVisibility,
+) -> Result<ChannelPolicy> {
+    append_policy_action(
+        base,
+        chan,
+        signer,
+        PolicyAction::SetVisibility { visibility },
+    )
+}
+
 fn authorize_policy_change(policy: &ChannelPolicy, actor: &str, role: PolicyRole) -> Result<()> {
     if policy.mode != PolicyMode::Restricted {
         bail!("channel must be restricted before roles can be changed");
@@ -394,6 +476,9 @@ fn authorize_policy_change(policy: &ChannelPolicy, actor: &str, role: PolicyRole
         PolicyRole::Moderator if !owner => bail!("only the owner can manage moderators"),
         PolicyRole::Writer if !owner && !moderator => {
             bail!("only the owner or a moderator can manage writers")
+        }
+        PolicyRole::Reader if !owner && !moderator => {
+            bail!("only the owner or a moderator can manage readers")
         }
         _ => Ok(()),
     }
@@ -557,6 +642,7 @@ fn apply_policy_action(
             let members = match role {
                 PolicyRole::Moderator => &mut policy.moderators,
                 PolicyRole::Writer => &mut policy.writers,
+                PolicyRole::Reader => &mut policy.readers,
             };
             if !members.contains(public_key) {
                 members.push(public_key.clone());
@@ -568,6 +654,7 @@ fn apply_policy_action(
             let members = match role {
                 PolicyRole::Moderator => &mut policy.moderators,
                 PolicyRole::Writer => &mut policy.writers,
+                PolicyRole::Reader => &mut policy.readers,
             };
             members.retain(|key| key != public_key);
         }
@@ -579,6 +666,16 @@ fn apply_policy_action(
             policy.owner = Some(new_owner.clone());
             policy.moderators.retain(|key| key != new_owner);
             policy.writers.retain(|key| key != new_owner);
+            policy.readers.retain(|key| key != new_owner);
+        }
+        PolicyAction::SetVisibility { visibility } => {
+            if policy.mode != PolicyMode::Restricted {
+                bail!("channel must be restricted before visibility can be changed");
+            }
+            if policy.owner.as_deref() != Some(actor) {
+                bail!("only the owner can change channel visibility");
+            }
+            policy.visibility = *visibility;
         }
     }
     Ok(())
@@ -1901,9 +1998,11 @@ mod tests {
         let legacy = ChannelPolicy {
             version: 1,
             mode: PolicyMode::Restricted,
+            visibility: ChannelVisibility::Public,
             owner: Some(owner.public_key.clone()),
             moderators: Vec::new(),
             writers: Vec::new(),
+            readers: Vec::new(),
         };
         std::fs::write(
             policy_path(&base, &chan),
@@ -1914,6 +2013,80 @@ mod tests {
         let history = read_policy_history(&base, &chan).unwrap();
         assert_eq!(history.len(), 2);
         assert!(matches!(history[0].action, PolicyAction::Adopt { .. }));
+    }
+
+    #[test]
+    fn private_visibility_and_reader_membership_are_signed_policy_state() {
+        let base = temp_dir();
+        init_layout(&base).unwrap();
+        let chan = ChannelRef::parse("test/private-members").unwrap();
+        create_channel(&base, &chan).unwrap();
+        let owner = KeypairFile::generate(Some("owner".into()));
+        let moderator = KeypairFile::generate(Some("moderator".into()));
+        let reader = KeypairFile::generate(Some("reader".into()));
+        let outsider = KeypairFile::generate(Some("outsider".into()));
+
+        assert!(set_channel_visibility(&base, &chan, &owner, ChannelVisibility::Private).is_err());
+        restrict_channel(&base, &chan, &owner).unwrap();
+        grant_role(
+            &base,
+            &chan,
+            &owner,
+            PolicyRole::Moderator,
+            &moderator.public_key,
+        )
+        .unwrap();
+        grant_role(
+            &base,
+            &chan,
+            &moderator,
+            PolicyRole::Reader,
+            &reader.public_key,
+        )
+        .unwrap();
+        let policy =
+            set_channel_visibility(&base, &chan, &owner, ChannelVisibility::Private).unwrap();
+
+        assert_eq!(policy.visibility, ChannelVisibility::Private);
+        assert!(policy_allows_read(&policy, &owner.public_key));
+        assert!(policy_allows_read(&policy, &moderator.public_key));
+        assert!(policy_allows_read(&policy, &reader.public_key));
+        assert!(!policy_allows_read(&policy, &outsider.public_key));
+        assert!(list_readable_channels(&base, None).unwrap().is_empty());
+        assert_eq!(
+            list_readable_channels(&base, Some(&reader.public_key)).unwrap(),
+            vec!["test/private-members"]
+        );
+        assert!(
+            list_readable_channels(&base, Some(&outsider.public_key))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(authorize_read(&base, &chan, &outsider.public_key).is_err());
+        let reader_post = Envelope::sign(
+            reader,
+            &chan.full_name,
+            Message::new_text(None, vec![], "not a writer".into(), vec![]),
+        )
+        .unwrap();
+        assert!(append_message(&base, &chan, &reader_post).is_err());
+        assert!(
+            set_channel_visibility(&base, &chan, &moderator, ChannelVisibility::Public).is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_policy_json_defaults_to_public_without_readers() {
+        let policy: ChannelPolicy = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "mode": "open",
+            "owner": null,
+            "moderators": [],
+            "writers": []
+        }))
+        .unwrap();
+        assert_eq!(policy.visibility, ChannelVisibility::Public);
+        assert!(policy.readers.is_empty());
     }
 
     #[test]

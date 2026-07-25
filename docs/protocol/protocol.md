@@ -33,12 +33,18 @@ record byte offsets and lengths. The index stores the log length it describes. A
 missing or stale index is rebuilt from the verified log while holding the channel
 lock; `log.ndjson` remains the source of truth.
 
-## Local channel write policy
+## Channel policy
 
 A channel may contain `policy.json`. If it is absent or has mode `open`, any valid
 signed envelope may be appended. A `restricted` policy names one owner and lists
 moderator and writer Ed25519 public keys. All three roles may append; only the owner
 may manage moderators, while the owner and moderators may manage writers.
+
+Policy also contains `visibility` (`public` by default) and a `readers` list.
+Private visibility requires restricted mode. Owners, moderators, writers, and
+readers may discover and synchronize a private channel; readers cannot append.
+Only the owner may change visibility, while owners and moderators may manage
+readers.
 
 Policy mutations are stored as channel-bound, Ed25519-signed events in
 `policy.ndjson`. Each event references the previous event ID. Replaying the chain
@@ -49,7 +55,8 @@ their existing owner.
 Authorization is checked inside the locked storage append path after envelope
 verification. This applies equally to local CLI posts, MCP posts, and envelopes
 received through sync. Signed policy histories are reconciled before messages.
-Policies restrict writes but do not restrict reads or encrypt channel data.
+Policies restrict writes and remote private-channel reads but do not encrypt
+channel data stored locally.
 
 ## Channel names
 
@@ -193,8 +200,18 @@ GET /status
 ```
 
 The response contains `{"ok":true,"channels":[...]}`. Clients may use this list to
-create missing local channel shells before synchronizing. Discovery reveals
-channel names and is therefore not suitable for private-channel membership.
+create missing local channel shells before synchronizing. Anonymous requests see
+only public channels.
+
+Authenticated clients send `x-embernet-public-key`, `x-embernet-timestamp`, and
+`x-embernet-signature` headers. The signature covers:
+
+```text
+embernet-discovery-v1\n<unix timestamp>\n/status
+```
+
+Valid signatures no more than 60 seconds old reveal private channels for which the
+signed policy recognizes that identity as owner, moderator, writer, or reader.
 
 The current sync protocol is implemented over WebSocket at:
 
@@ -202,7 +219,9 @@ The current sync protocol is implemented over WebSocket at:
 GET /sync
 ```
 
-Sync v5 reconciles one channel per connection. Before message reconciliation, the
+Sync v6 reconciles one channel per connection. The opening packet authenticates
+the requester with a timestamped signature bound to the channel. Private channels
+reject non-members before returning policy or message data. Before message reconciliation, the
 initiator sends its complete signed policy history. Peers accept verified prefix
 extensions; a fork is saved under `policy-conflicts/` and aborts message sync.
 
@@ -220,8 +239,11 @@ into 256 buckets. Each bucket hash is BLAKE3 over its lexicographically sorted r
 ```json
 {
   "type": "status",
-  "version": 5,
+  "version": 6,
   "channel": "tech/linux",
+  "requester": "ed25519-public-key-hex",
+  "auth_ts": 1784990000,
+  "auth_sig": "ed25519-signature-hex",
   "policy_events": [],
   "moderation_events": [],
   "chunks": [{"index": 79, "count": 12, "hash": "a2..."}]
@@ -233,8 +255,11 @@ Fields:
 | Field | Type | Description |
 | --- | --- | --- |
 | `type` | string | Must be `"status"`. |
-| `version` | integer | Must be `5`. |
+| `version` | integer | Must be `6`. |
 | `channel` | string | Channel to synchronize. |
+| `requester` | string | Ed25519 public key of the initiating node. |
+| `auth_ts` | integer | Unix timestamp, accepted within 60 seconds. |
+| `auth_sig` | string | Signature over `embernet-sync-auth-v1\n<timestamp>\n<channel>`. |
 | `policy_events` | array | Complete signed policy-event chain. |
 | `moderation_events` | array | Complete signed moderation-event chain. |
 | `chunks` | array | Non-empty bucket summaries: prefix index, ID count, and hash. |
@@ -278,8 +303,12 @@ so retrying a partially completed sync is safe.
 - A differing prefix bucket exchanges its complete ID list.
 - Differing inventories are capped at 100,000 IDs per peer and exchange.
 - One channel is reconciled per WebSocket connection.
-- Channel discovery is unauthenticated and exposes all local channel names.
-- Sync v4 peers are not wire-compatible with v5.
+- Private data is not encrypted at rest; local data-directory access bypasses
+  remote membership controls.
+- Revoked members retain any plaintext data synchronized before revocation.
+- Channel membership and visibility are visible to authorized peers in policy
+  history.
+- Sync v5 peers are not wire-compatible with v6.
 - Policy histories are sent in full before every exchange.
 - Moderation histories are sent in full before every exchange.
 - Historical messages are authorized against current policy state rather than the
