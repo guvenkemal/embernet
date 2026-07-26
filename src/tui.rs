@@ -6,7 +6,7 @@ use crate::store::{
 use crate::sync;
 use crate::{peers, sync::PeerSyncSummary};
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -38,6 +38,29 @@ enum Action {
     None,
     Post(String),
     Sync(String),
+}
+
+struct TerminalRestore {
+    active: bool,
+}
+
+impl TerminalRestore {
+    fn armed() -> Self {
+        Self { active: true }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for TerminalRestore {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -100,7 +123,7 @@ struct App {
 impl App {
     fn load(datadir: PathBuf) -> Result<Self> {
         let identity_path = datadir.join("keys/identity.json");
-        let identity = KeypairFile::load(&identity_path)
+        let identity = KeypairFile::load_secure(&identity_path)
             .with_context(|| format!("load identity {}", identity_path.display()))?;
         let peers = peers::list_peers(&datadir)?;
         let channels = store::list_readable_channels(&datadir, Some(&identity.public_key))?;
@@ -263,6 +286,7 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
             KeyCode::Up | KeyCode::Char('K') => {
                 if self.selected > 0 {
                     self.selected -= 1;
@@ -422,7 +446,7 @@ pub async fn run(datadir: PathBuf, listen: Option<String>) -> Result<()> {
         None => None,
     };
     let (sync_tx, mut sync_rx) = mpsc::unbounded_channel();
-    let sync_task = tokio::spawn(auto_sync_worker(app.datadir.clone(), sync_tx));
+    let sync_task = tokio::spawn(auto_sync_worker(app.datadir.clone(), sync_tx.clone()));
     if let Err(error) = enable_raw_mode() {
         sync_task.abort();
         if let Some(server) = managed_server {
@@ -440,6 +464,7 @@ pub async fn run(datadir: PathBuf, listen: Option<String>) -> Result<()> {
         return Err(error.into());
     }
     let backend = CrosstermBackend::new(stdout);
+    let mut terminal_restore = TerminalRestore::armed();
     let mut terminal = match Terminal::new(backend) {
         Ok(terminal) => terminal,
         Err(error) => {
@@ -453,8 +478,18 @@ pub async fn run(datadir: PathBuf, listen: Option<String>) -> Result<()> {
         }
     };
 
-    let result = run_loop(&mut terminal, &mut app, &mut sync_rx).await;
+    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
+    let signal_task = tokio::spawn(wait_for_shutdown_signal(shutdown_tx));
+    let result = run_loop(
+        &mut terminal,
+        &mut app,
+        &mut sync_rx,
+        &sync_tx,
+        &mut shutdown_rx,
+    )
+    .await;
     sync_task.abort();
+    signal_task.abort();
     let terminal_cleanup = (|| -> Result<()> {
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -465,6 +500,7 @@ pub async fn run(datadir: PathBuf, listen: Option<String>) -> Result<()> {
         Some(server) => server.shutdown().await,
         None => Ok(()),
     };
+    terminal_restore.disarm();
     result?;
     terminal_cleanup?;
     server_cleanup
@@ -474,9 +510,15 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     sync_rx: &mut mpsc::UnboundedReceiver<AutoSyncEvent>,
+    sync_tx: &mpsc::UnboundedSender<AutoSyncEvent>,
+    shutdown_rx: &mut mpsc::UnboundedReceiver<()>,
 ) -> Result<()> {
     let mut last_local_refresh = Instant::now();
     while !app.quit {
+        if shutdown_rx.try_recv().is_ok() {
+            app.quit = true;
+            continue;
+        }
         while let Ok(event) = sync_rx.try_recv() {
             app.apply_auto_sync(event);
         }
@@ -492,12 +534,58 @@ async fn run_loop(
             && key.kind == KeyEventKind::Press
         {
             let action = app.handle_key(key)?;
-            if action != Action::None {
+            if let Action::Sync(peer) = action {
+                let channel = app.channel().context("no channel selected")?.to_string();
+                let peer = peers::add_peer(&app.datadir, &peer)?;
+                app.peers = peers::list_peers(&app.datadir)?;
+                app.status = format!("syncing · {peer}");
+                let datadir = app.datadir.clone();
+                let tx = sync_tx.clone();
+                tokio::spawn(async move {
+                    let event = match sync::sync_from_peer(&datadir, &peer, &channel).await {
+                        Ok(received) => AutoSyncEvent::Complete {
+                            peer,
+                            summary: sync::PeerSyncSummary {
+                                channels: 1,
+                                received,
+                            },
+                        },
+                        Err(error) => AutoSyncEvent::Failed {
+                            peer,
+                            error: format!("{error:#}"),
+                        },
+                    };
+                    let _ = tx.send(event);
+                });
+            } else if action != Action::None {
                 app.apply(action).await;
             }
         }
     }
     Ok(())
+}
+
+async fn wait_for_shutdown_signal(tx: mpsc::UnboundedSender<()>) {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                if let Some(signal) = &mut terminate {
+                    signal.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    let _ = tx.send(());
 }
 
 async fn auto_sync_worker(datadir: PathBuf, tx: mpsc::UnboundedSender<AutoSyncEvent>) {

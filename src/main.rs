@@ -217,6 +217,7 @@ impl From<VisibilityArg> for ChannelVisibility {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -271,7 +272,7 @@ async fn main() -> Result<()> {
         }
         Commands::ChannelRestrict { channel } => {
             let chan = ChannelRef::parse(&channel)?;
-            let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
+            let identity = KeypairFile::load_secure(&datadir.join("keys/identity.json"))?;
             let policy = store::restrict_channel(&datadir, &chan, &identity)?;
             println!("{}", serde_json::to_string_pretty(&policy)?);
         }
@@ -281,7 +282,7 @@ async fn main() -> Result<()> {
             public_key,
         } => {
             let chan = ChannelRef::parse(&channel)?;
-            let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
+            let identity = KeypairFile::load_secure(&datadir.join("keys/identity.json"))?;
             let policy = store::grant_role(&datadir, &chan, &identity, role.into(), &public_key)?;
             println!("{}", serde_json::to_string_pretty(&policy)?);
         }
@@ -291,7 +292,7 @@ async fn main() -> Result<()> {
             public_key,
         } => {
             let chan = ChannelRef::parse(&channel)?;
-            let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
+            let identity = KeypairFile::load_secure(&datadir.join("keys/identity.json"))?;
             let policy = store::revoke_role(&datadir, &chan, &identity, role.into(), &public_key)?;
             println!("{}", serde_json::to_string_pretty(&policy)?);
         }
@@ -300,7 +301,7 @@ async fn main() -> Result<()> {
             public_key,
         } => {
             let chan = ChannelRef::parse(&channel)?;
-            let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
+            let identity = KeypairFile::load_secure(&datadir.join("keys/identity.json"))?;
             let policy = store::transfer_ownership(&datadir, &chan, &identity, &public_key)?;
             println!("{}", serde_json::to_string_pretty(&policy)?);
         }
@@ -309,7 +310,7 @@ async fn main() -> Result<()> {
             visibility,
         } => {
             let chan = ChannelRef::parse(&channel)?;
-            let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
+            let identity = KeypairFile::load_secure(&datadir.join("keys/identity.json"))?;
             let policy =
                 store::set_channel_visibility(&datadir, &chan, &identity, visibility.into())?;
             println!("{}", serde_json::to_string_pretty(&policy)?);
@@ -320,7 +321,7 @@ async fn main() -> Result<()> {
             reason,
         } => {
             let chan = ChannelRef::parse(&channel)?;
-            let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
+            let identity = KeypairFile::load_secure(&datadir.join("keys/identity.json"))?;
             let state = store::tombstone_message(&datadir, &chan, &identity, &message_id, reason)?;
             println!("{}", serde_json::to_string_pretty(&state)?);
         }
@@ -329,7 +330,7 @@ async fn main() -> Result<()> {
             message_id,
         } => {
             let chan = ChannelRef::parse(&channel)?;
-            let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
+            let identity = KeypairFile::load_secure(&datadir.join("keys/identity.json"))?;
             let state = store::restore_message(&datadir, &chan, &identity, &message_id)?;
             println!("{}", serde_json::to_string_pretty(&state)?);
         }
@@ -359,7 +360,7 @@ async fn main() -> Result<()> {
             refs,
         } => {
             let chan = ChannelRef::parse(&channel)?;
-            let kp = KeypairFile::load(&datadir.join("keys/identity.json"))?;
+            let kp = KeypairFile::load_secure(&datadir.join("keys/identity.json"))?;
             let msg = Message::new_text(title, tags, body, refs);
             let env = store::sign_message_for_channel(&datadir, &chan, kp, msg)?;
             let id = append_message(&datadir, &chan, &env)?;
@@ -371,7 +372,7 @@ async fn main() -> Result<()> {
             include_tombstoned,
         } => {
             let chan = ChannelRef::parse(&channel)?;
-            let identity = KeypairFile::load(&datadir.join("keys/identity.json"))?;
+            let identity = KeypairFile::load_secure(&datadir.join("keys/identity.json"))?;
             store::authorize_read(&datadir, &chan, &identity.public_key)?;
             let msgs =
                 read_channel_tail_decrypted_with_options(&datadir, &chan, n, include_tombstoned)?;

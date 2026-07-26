@@ -286,7 +286,7 @@ fn post_message(datadir: &Path, args: PostMessageArgs) -> Result<Value> {
 
 fn load_identity(datadir: &Path) -> Result<KeypairFile> {
     let identity_path = datadir.join("keys/identity.json");
-    KeypairFile::load(&identity_path).with_context(|| {
+    KeypairFile::load_secure(&identity_path).with_context(|| {
         format!(
             "failed to load identity keypair at {}",
             identity_path.display()
@@ -338,6 +338,7 @@ fn ensure_under_datadir(datadir: &Path, path: &Path) -> Result<()> {
 }
 
 fn read_mcp_message<R: BufRead + Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
+    const MAX_MCP_MESSAGE_BYTES: usize = 1_048_576;
     let mut content_length: Option<usize> = None;
 
     loop {
@@ -352,18 +353,24 @@ fn read_mcp_message<R: BufRead + Read>(reader: &mut R) -> Result<Option<Vec<u8>>
             break;
         }
 
-        if let Some((name, value)) = trimmed.split_once(':') {
-            if name.eq_ignore_ascii_case("Content-Length") {
-                content_length = Some(
-                    value
-                        .trim()
-                        .parse::<usize>()
-                        .context("invalid Content-Length header")?,
-                );
+        if trimmed.starts_with('{') {
+            if trimmed.len() > MAX_MCP_MESSAGE_BYTES {
+                anyhow::bail!("MCP message exceeds {MAX_MCP_MESSAGE_BYTES} bytes");
             }
-        } else if trimmed.starts_with('{') {
-            // Developer-friendly fallback for newline-delimited JSON during local testing.
             return Ok(Some(trimmed.as_bytes().to_vec()));
+        }
+
+        if let Some((name, value)) = trimmed.split_once(':')
+            && name.eq_ignore_ascii_case("Content-Length")
+        {
+            let length = value
+                .trim()
+                .parse::<usize>()
+                .context("invalid Content-Length header")?;
+            if length > MAX_MCP_MESSAGE_BYTES {
+                anyhow::bail!("MCP message exceeds {MAX_MCP_MESSAGE_BYTES} bytes");
+            }
+            content_length = Some(length);
         }
     }
 
@@ -410,5 +417,41 @@ fn tool_error(err: anyhow::Error) -> JsonRpcError {
         code: -32000,
         message: "Tool execution failed".to_string(),
         data: Some(json!({ "details": err.to_string() })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn reads_newline_delimited_json_with_colons() {
+        let message = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let mut input = message.to_vec();
+        input.push(b'\n');
+        let mut reader = Cursor::new(input);
+        assert_eq!(
+            read_mcp_message(&mut reader).unwrap(),
+            Some(message.to_vec())
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_content_length_before_allocating() {
+        let mut reader = Cursor::new(b"Content-Length: 1048577\r\n\r\n".to_vec());
+        assert!(read_mcp_message(&mut reader).is_err());
+    }
+
+    #[test]
+    fn reads_content_length_framing() {
+        let body = br#"{"jsonrpc":"2.0"}"#;
+        let input = format!("Content-Length: {}\r\n\r\n", body.len())
+            .into_bytes()
+            .into_iter()
+            .chain(body.iter().copied())
+            .collect::<Vec<_>>();
+        let mut reader = Cursor::new(input);
+        assert_eq!(read_mcp_message(&mut reader).unwrap(), Some(body.to_vec()));
     }
 }

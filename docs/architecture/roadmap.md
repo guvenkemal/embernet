@@ -35,6 +35,7 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - Signed private visibility, reader membership, and authenticated discovery ✅
 - Authenticated private-channel synchronization ✅
 - End-to-end encrypted private message bodies and membership-key rotation ✅
+- Challenge-bound replay-resistant authentication and security hardening ✅
 - next: encrypt private message metadata and add explicit key recovery/export.
 - planned: Web UI client.
 
@@ -57,7 +58,8 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 
 ## Current status
 
-Phase 1 is active. Sync v7 authenticates the initiating identity, enforces private
+Phase 1 is active. Sync v8 uses one-time responder-bound challenges to authenticate
+the initiating identity, enforces private
 membership, and reconciles signed policy and moderation histories before
 exchanging member-wrapped encryption keys and using deterministic Merkle buckets
 to localize divergent messages. Private message bodies use XChaCha20-Poly1305;

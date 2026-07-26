@@ -321,6 +321,10 @@ pub fn read_channel_policy(base: &Path, chan: &ChannelRef) -> Result<ChannelPoli
     if policy_log_path(base, chan).exists() {
         return derive_policy(chan, &read_policy_history(base, chan)?);
     }
+    read_policy_cache(base, chan)
+}
+
+fn read_policy_cache(base: &Path, chan: &ChannelRef) -> Result<ChannelPolicy> {
     let path = policy_path(base, chan);
     if !path.exists() {
         return Ok(ChannelPolicy::default());
@@ -533,6 +537,12 @@ fn policy_log_path(base: &Path, chan: &ChannelRef) -> PathBuf {
 }
 
 pub fn read_policy_history(base: &Path, chan: &ChannelRef) -> Result<Vec<PolicyEvent>> {
+    let lock = open_history_lock(base, chan, "policy.lock")?;
+    FileExt::lock_shared(&lock)?;
+    read_policy_history_unlocked(base, chan)
+}
+
+fn read_policy_history_unlocked(base: &Path, chan: &ChannelRef) -> Result<Vec<PolicyEvent>> {
     let path = policy_log_path(base, chan);
     if !path.exists() {
         return Ok(Vec::new());
@@ -567,9 +577,15 @@ fn append_policy_action(
     let log_path = channel_dir.join("log.ndjson");
     let log = OpenOptions::new().read(true).open(&log_path)?;
     FileExt::lock_exclusive(&log).with_context(|| format!("lock {}", log_path.display()))?;
-    let mut events = read_policy_history(base, chan)?;
+    let policy_lock = open_history_lock(base, chan, "policy.lock")?;
+    FileExt::lock_exclusive(&policy_lock)?;
+    let mut events = read_policy_history_unlocked(base, chan)?;
     let first_new_event = events.len();
-    let cached = read_channel_policy(base, chan)?;
+    let cached = if events.is_empty() {
+        read_policy_cache(base, chan)?
+    } else {
+        derive_policy(chan, &events)?
+    };
     if events.is_empty() && cached.mode == PolicyMode::Restricted {
         if cached.owner.as_deref() != Some(&signer.public_key) {
             bail!("only the legacy policy owner can adopt it into signed history");
@@ -726,7 +742,9 @@ fn apply_policy_action(
 }
 
 pub fn rebuild_policy_cache(base: &Path, chan: &ChannelRef) -> Result<ChannelPolicy> {
-    let policy = derive_policy(chan, &read_policy_history(base, chan)?)?;
+    let lock = open_history_lock(base, chan, "policy.lock")?;
+    FileExt::lock_exclusive(&lock)?;
+    let policy = derive_policy(chan, &read_policy_history_unlocked(base, chan)?)?;
     let path = policy_path(base, chan);
     let temp = path.with_extension("json.tmp");
     std::fs::write(&temp, serde_json::to_vec_pretty(&policy)?)?;
@@ -747,7 +765,9 @@ pub fn append_remote_policy_history(
     let log_path = channel_dir.join("log.ndjson");
     let log = OpenOptions::new().read(true).open(&log_path)?;
     FileExt::lock_exclusive(&log).with_context(|| format!("lock {}", log_path.display()))?;
-    let local = read_policy_history(base, chan)?;
+    let policy_lock = open_history_lock(base, chan, "policy.lock")?;
+    FileExt::lock_exclusive(&policy_lock)?;
+    let local = read_policy_history_unlocked(base, chan)?;
     validate_policy_history(chan, remote)?;
     if local.len() > remote.len()
         || !local
@@ -837,6 +857,16 @@ pub fn resolve_policy_conflict(
     let log_path = channel_to_path(base, &chan.full_name).join("log.ndjson");
     let log = OpenOptions::new().read(true).open(&log_path)?;
     FileExt::lock_exclusive(&log).with_context(|| format!("lock {}", log_path.display()))?;
+    let policy_lock = open_history_lock(base, chan, "policy.lock")?;
+    FileExt::lock_exclusive(&policy_lock)?;
+    let current = read_policy_history_unlocked(base, chan)?;
+    if !current.is_empty()
+        && current.last().map(|event| event.id.as_str())
+            != events.last().map(|event| event.id.as_str())
+    {
+        save_policy_conflict(base, chan, &current)
+            .context("preserve displaced local policy history")?;
+    }
     let history_path = policy_log_path(base, chan);
     let temp = history_path.with_extension("ndjson.tmp");
     let mut data = Vec::new();
@@ -867,6 +897,15 @@ fn moderation_cache_path(base: &Path, chan: &ChannelRef) -> PathBuf {
 }
 
 pub fn read_moderation_history(base: &Path, chan: &ChannelRef) -> Result<Vec<ModerationEvent>> {
+    let lock = open_history_lock(base, chan, "moderation.lock")?;
+    FileExt::lock_shared(&lock)?;
+    read_moderation_history_unlocked(base, chan)
+}
+
+fn read_moderation_history_unlocked(
+    base: &Path,
+    chan: &ChannelRef,
+) -> Result<Vec<ModerationEvent>> {
     let path = moderation_log_path(base, chan);
     if !path.exists() {
         return Ok(Vec::new());
@@ -938,7 +977,9 @@ fn append_moderation_action(
     let log_path = channel_to_path(base, &chan.full_name).join("log.ndjson");
     let log = OpenOptions::new().read(true).open(&log_path)?;
     FileExt::lock_exclusive(&log).with_context(|| format!("lock {}", log_path.display()))?;
-    let mut events = read_moderation_history(base, chan)?;
+    let moderation_lock = open_history_lock(base, chan, "moderation.lock")?;
+    FileExt::lock_exclusive(&moderation_lock)?;
+    let mut events = read_moderation_history_unlocked(base, chan)?;
     let previous = events.last().map(|event| event.id.clone());
     let policy_head = read_policy_history(base, chan)?
         .last()
@@ -1066,7 +1107,9 @@ pub fn append_remote_moderation_history(
     let log_path = channel_to_path(base, &chan.full_name).join("log.ndjson");
     let log = OpenOptions::new().read(true).open(&log_path)?;
     FileExt::lock_exclusive(&log).with_context(|| format!("lock {}", log_path.display()))?;
-    let local = read_moderation_history(base, chan)?;
+    let moderation_lock = open_history_lock(base, chan, "moderation.lock")?;
+    FileExt::lock_exclusive(&moderation_lock)?;
+    let local = read_moderation_history_unlocked(base, chan)?;
     validate_moderation_history(base, chan, remote)?;
     if local.len() > remote.len()
         || !local
@@ -1158,6 +1201,16 @@ pub fn resolve_moderation_conflict(
     let channel_log = OpenOptions::new().read(true).open(&channel_log_path)?;
     FileExt::lock_exclusive(&channel_log)
         .with_context(|| format!("lock {}", channel_log_path.display()))?;
+    let moderation_lock = open_history_lock(base, chan, "moderation.lock")?;
+    FileExt::lock_exclusive(&moderation_lock)?;
+    let current = read_moderation_history_unlocked(base, chan)?;
+    if !current.is_empty()
+        && current.last().map(|event| event.id.as_str())
+            != events.last().map(|event| event.id.as_str())
+    {
+        save_moderation_conflict(base, chan, &current)
+            .context("preserve displaced local moderation history")?;
+    }
     let history_path = moderation_log_path(base, chan);
     let temp = history_path.with_extension("ndjson.tmp");
     let mut data = Vec::new();
@@ -1181,6 +1234,17 @@ fn write_moderation_cache(base: &Path, chan: &ChannelRef, state: &ModerationStat
 
 fn index_path(log_path: &Path) -> PathBuf {
     log_path.with_file_name("index.redb")
+}
+
+fn open_history_lock(base: &Path, chan: &ChannelRef, name: &str) -> Result<std::fs::File> {
+    let path = channel_to_path(base, &chan.full_name).join(name);
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))
 }
 
 fn encode_location(offset: u64, length: u64) -> [u8; 16] {
@@ -1325,6 +1389,7 @@ fn index_insert(db: &Database, id: &str, offset: u64, length: u64, log_len: u64)
     Ok(())
 }
 
+#[cfg(test)]
 fn read_verified_log(path: &Path) -> Result<Vec<Envelope>> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -1334,6 +1399,7 @@ fn read_verified_log(path: &Path) -> Result<Vec<Envelope>> {
     read_verified_file(&mut file, path)
 }
 
+#[cfg(test)]
 fn read_verified_file(file: &mut std::fs::File, path: &Path) -> Result<Vec<Envelope>> {
     Ok(scan_verified_file(file, path)?
         .into_iter()
@@ -1428,14 +1494,39 @@ pub fn read_channel_tail_with_options(
     n: usize,
     include_tombstoned: bool,
 ) -> Result<Vec<Envelope>> {
-    let p = channel_to_path(base, &chan.full_name).join("log.ndjson");
-    let mut envelopes = read_verified_log(&p)?;
-    if !include_tombstoned {
-        let moderation = moderation_state(base, chan)?;
-        envelopes.retain(|env| !moderation.tombstoned.contains_key(&env.id));
+    if n == 0 {
+        return Ok(Vec::new());
     }
-    let start = envelopes.len().saturating_sub(n);
-    Ok(envelopes[start..].to_vec())
+    let moderation = if include_tombstoned {
+        ModerationState::default()
+    } else {
+        moderation_state(base, chan)?
+    };
+    let path = channel_to_path(base, &chan.full_name).join("log.ndjson");
+    let mut log = OpenOptions::new().read(true).open(&path)?;
+    FileExt::lock_exclusive(&log).with_context(|| format!("lock {}", path.display()))?;
+    let db = ensure_index(&mut log, &path)?;
+    let read = db.begin_read()?;
+    let table = read.open_table(INDEX)?;
+    let mut locations = Vec::new();
+    for entry in table.iter()? {
+        let (id, location) = entry?;
+        let (offset, length) = decode_location(location.value())?;
+        locations.push((offset, length, id.value().to_string()));
+    }
+    locations.sort_by_key(|(offset, _, _)| std::cmp::Reverse(*offset));
+    let mut envelopes = Vec::with_capacity(n.min(locations.len()));
+    for (offset, length, id) in locations {
+        if !include_tombstoned && moderation.tombstoned.contains_key(&id) {
+            continue;
+        }
+        envelopes.push(read_indexed_envelope(&mut log, chan, &id, offset, length)?);
+        if envelopes.len() == n {
+            break;
+        }
+    }
+    envelopes.reverse();
+    Ok(envelopes)
 }
 
 /// Count total messages (non-empty lines) in a channel log.
@@ -1542,6 +1633,16 @@ pub fn read_message_by_id(base: &Path, chan: &ChannelRef, id: &str) -> Result<En
         decode_location(value.value())?
     };
     let (offset, length) = location;
+    read_indexed_envelope(&mut log, chan, id, offset, length)
+}
+
+fn read_indexed_envelope(
+    log: &mut std::fs::File,
+    chan: &ChannelRef,
+    id: &str,
+    offset: u64,
+    length: u64,
+) -> Result<Envelope> {
     log.seek(SeekFrom::Start(offset))?;
     let mut record = vec![0_u8; length as usize];
     log.read_exact(&mut record)?;
@@ -2050,6 +2151,72 @@ mod tests {
         bytes.push(b'\n');
         std::fs::write(path, bytes).unwrap();
         assert!(read_policy_history(&base, &chan).is_err());
+    }
+
+    #[test]
+    fn resolving_policy_fork_preserves_displaced_local_history() {
+        let base = temp_dir();
+        let fork = temp_dir();
+        let chan = ChannelRef::parse("test/policy-resolution").unwrap();
+        for dir in [&base, &fork] {
+            init_layout(dir).unwrap();
+            create_channel(dir, &chan).unwrap();
+        }
+        let owner = KeypairFile::generate(None);
+        let local_writer = KeypairFile::generate(None);
+        let fork_writer = KeypairFile::generate(None);
+        let later_writer = KeypairFile::generate(None);
+        restrict_channel(&base, &chan, &owner).unwrap();
+        std::fs::copy(policy_log_path(&base, &chan), policy_log_path(&fork, &chan)).unwrap();
+        std::fs::copy(policy_path(&base, &chan), policy_path(&fork, &chan)).unwrap();
+        grant_role(
+            &base,
+            &chan,
+            &owner,
+            PolicyRole::Writer,
+            &local_writer.public_key,
+        )
+        .unwrap();
+        grant_role(
+            &fork,
+            &chan,
+            &owner,
+            PolicyRole::Writer,
+            &fork_writer.public_key,
+        )
+        .unwrap();
+        let selected = read_policy_history(&fork, &chan).unwrap();
+        let selected_head = save_policy_conflict(&base, &chan, &selected).unwrap();
+        grant_role(
+            &base,
+            &chan,
+            &owner,
+            PolicyRole::Writer,
+            &later_writer.public_key,
+        )
+        .unwrap();
+        let displaced_head = read_policy_history(&base, &chan)
+            .unwrap()
+            .last()
+            .unwrap()
+            .id
+            .clone();
+
+        resolve_policy_conflict(&base, &chan, &selected_head).unwrap();
+
+        assert!(
+            policy_conflict_dir(&base, &chan)
+                .join(format!("{displaced_head}.ndjson"))
+                .is_file()
+        );
+        assert_eq!(
+            read_policy_history(&base, &chan)
+                .unwrap()
+                .last()
+                .unwrap()
+                .id,
+            selected_head
+        );
     }
 
     #[test]

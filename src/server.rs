@@ -1,4 +1,4 @@
-use crate::proto::verify_bytes;
+use crate::proto::{KeypairFile, verify_bytes};
 use crate::sync;
 use anyhow::{Context, Result};
 use axum::{
@@ -10,15 +10,17 @@ use axum::{
     routing::get,
 };
 use serde::Serialize;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-#[derive(Clone)]
 pub struct AppState {
     pub datadir: PathBuf,
+    pub responder: String,
+    discovery_challenges: std::sync::Mutex<HashMap<String, i64>>,
 }
 
 #[derive(Serialize)]
@@ -27,10 +29,17 @@ struct Status {
     channels: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct Challenge {
+    nonce: String,
+    responder: String,
+    expires: i64,
+}
+
 pub struct ServerHandle {
     addr: SocketAddr,
     shutdown: Option<oneshot::Sender<()>>,
-    task: JoinHandle<Result<()>>,
+    task: Option<JoinHandle<Result<()>>>,
 }
 
 impl ServerHandle {
@@ -42,7 +51,30 @@ impl ServerHandle {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        self.task.await.context("join server task")?
+        self.task
+            .take()
+            .context("server task is unavailable")?
+            .await
+            .context("join server task")?
+    }
+
+    pub async fn wait(mut self) -> Result<()> {
+        self.task
+            .take()
+            .context("server task is unavailable")?
+            .await
+            .context("join server task")?
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -67,26 +99,66 @@ pub async fn start(datadir: PathBuf, listen: &str) -> Result<ServerHandle> {
     Ok(ServerHandle {
         addr,
         shutdown: Some(shutdown_tx),
-        task,
+        task: Some(task),
     })
 }
 
 pub async fn run(datadir: PathBuf, listen: String) -> Result<()> {
     let server = start(datadir, &listen).await?;
     tracing::info!("listening on {}", server.local_addr());
-    server.task.await.context("join server task")?
+    server.wait().await
 }
 
 pub(crate) fn router(datadir: PathBuf) -> Router {
-    let state = AppState { datadir };
+    let responder = KeypairFile::load_secure(&datadir.join("keys/identity.json"))
+        .map(|identity| identity.public_key.clone())
+        .unwrap_or_else(|_| hex::encode(rand::random::<[u8; 32]>()));
+    let state = AppState {
+        datadir,
+        responder,
+        discovery_challenges: std::sync::Mutex::new(HashMap::new()),
+    };
     Router::new()
+        .route("/challenge", get(challenge))
         .route("/status", get(status))
         .route("/sync", get(ws_sync_handler))
         .with_state(Arc::new(state))
 }
 
+async fn challenge(State(state): State<Arc<AppState>>) -> Response {
+    const MAX_DISCOVERY_CHALLENGES: usize = 10_000;
+    let nonce = hex::encode(rand::random::<[u8; 32]>());
+    let expires = chrono::Utc::now().timestamp() + 60;
+    let mut challenges = match state.discovery_challenges.lock() {
+        Ok(challenges) => challenges,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok": false, "error": "challenge state unavailable"})),
+            )
+                .into_response();
+        }
+    };
+    let now = chrono::Utc::now().timestamp();
+    challenges.retain(|_, expiry| *expiry >= now);
+    if challenges.len() >= MAX_DISCOVERY_CHALLENGES {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"ok": false, "error": "too many active challenges"})),
+        )
+            .into_response();
+    }
+    challenges.insert(nonce.clone(), expires);
+    Json(Challenge {
+        nonce,
+        responder: state.responder.clone(),
+        expires,
+    })
+    .into_response()
+}
+
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let requester = match discovery_requester(&headers) {
+    let requester = match discovery_requester(&state, &headers) {
         Ok(requester) => requester,
         Err(error) => {
             return (
@@ -105,11 +177,12 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     .into_response()
 }
 
-fn discovery_requester(headers: &HeaderMap) -> Result<Option<String>> {
+fn discovery_requester(state: &AppState, headers: &HeaderMap) -> Result<Option<String>> {
     let key = headers.get(sync::DISCOVERY_KEY_HEADER);
     let timestamp = headers.get(sync::DISCOVERY_TIMESTAMP_HEADER);
     let signature = headers.get(sync::DISCOVERY_SIGNATURE_HEADER);
-    if key.is_none() && timestamp.is_none() && signature.is_none() {
+    let nonce = headers.get(sync::DISCOVERY_NONCE_HEADER);
+    if key.is_none() && timestamp.is_none() && signature.is_none() && nonce.is_none() {
         return Ok(None);
     }
     let key = key.context("missing discovery public key")?.to_str()?;
@@ -119,11 +192,28 @@ fn discovery_requester(headers: &HeaderMap) -> Result<Option<String>> {
         .parse()
         .context("invalid discovery timestamp")?;
     let signature = signature.context("missing discovery signature")?.to_str()?;
+    let nonce = nonce.context("missing discovery nonce")?.to_str()?;
     if (chrono::Utc::now().timestamp() - timestamp).abs() > 60 {
         anyhow::bail!("stale discovery signature");
     }
-    verify_bytes(key, signature, &sync::discovery_auth_payload(timestamp))
-        .context("invalid discovery signature")?;
+    let mut challenges = state
+        .discovery_challenges
+        .lock()
+        .map_err(|_| anyhow::anyhow!("challenge state unavailable"))?;
+    let expires = challenges
+        .get(nonce)
+        .copied()
+        .context("unknown or already consumed discovery challenge")?;
+    if expires < chrono::Utc::now().timestamp() {
+        anyhow::bail!("expired discovery challenge");
+    }
+    verify_bytes(
+        key,
+        signature,
+        &sync::discovery_auth_payload(timestamp, nonce, &state.responder),
+    )
+    .context("invalid discovery signature")?;
+    challenges.remove(nonce);
     Ok(Some(key.to_string()))
 }
 
@@ -138,6 +228,7 @@ async fn ws_sync_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
 
     #[tokio::test]
     async fn managed_server_reports_actual_address_and_shuts_down() {
@@ -165,5 +256,46 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let result = start(PathBuf::new(), &address.to_string()).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn discovery_challenge_is_consumed_once() {
+        let identity = KeypairFile::generate(Some("alice".into()));
+        let nonce = hex::encode(rand::random::<[u8; 32]>());
+        let responder = hex::encode(rand::random::<[u8; 32]>());
+        let timestamp = chrono::Utc::now().timestamp();
+        let signature = identity
+            .sign_bytes(&sync::discovery_auth_payload(timestamp, &nonce, &responder))
+            .unwrap();
+        let state = AppState {
+            datadir: PathBuf::new(),
+            responder,
+            discovery_challenges: std::sync::Mutex::new(HashMap::from([(
+                nonce.clone(),
+                timestamp + 60,
+            )])),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            sync::DISCOVERY_KEY_HEADER,
+            HeaderValue::from_str(&identity.public_key).unwrap(),
+        );
+        headers.insert(
+            sync::DISCOVERY_TIMESTAMP_HEADER,
+            HeaderValue::from_str(&timestamp.to_string()).unwrap(),
+        );
+        headers.insert(
+            sync::DISCOVERY_SIGNATURE_HEADER,
+            HeaderValue::from_str(&signature).unwrap(),
+        );
+        headers.insert(
+            sync::DISCOVERY_NONCE_HEADER,
+            HeaderValue::from_str(&nonce).unwrap(),
+        );
+        assert_eq!(
+            discovery_requester(&state, &headers).unwrap(),
+            Some(identity.public_key.clone())
+        );
+        assert!(discovery_requester(&state, &headers).is_err());
     }
 }

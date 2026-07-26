@@ -12,6 +12,7 @@ pub fn valid_channel(name: &str) -> bool {
         && !name.is_empty()
         && !name.starts_with('/')
         && !name.ends_with('/')
+        && !name.contains("//")
 }
 
 pub fn channel_to_path(base: &Path, name: &str) -> PathBuf {
@@ -61,6 +62,11 @@ mod tests {
         assert!(!valid_channel("tech@linux"));
         assert!(!valid_channel("tech.linux"));
         assert!(!valid_channel("tech*linux"));
+    }
+
+    #[test]
+    fn valid_channel_rejects_empty_path_segments() {
+        assert!(!valid_channel("tech//linux"));
     }
 
     #[test]

@@ -4,8 +4,10 @@ use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Zeroize)]
+#[zeroize(drop)]
 pub struct KeypairFile {
     pub alias: Option<String>,
     pub public_key: String, // hex
@@ -23,15 +25,43 @@ impl KeypairFile {
         }
     }
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
-        std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
+        use std::io::Write;
+        let suffix: u64 = rand::random();
+        let temp = path.with_extension(format!("json.tmp-{suffix:016x}"));
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(&serde_json::to_vec_pretty(self)?)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
         Ok(())
     }
     pub fn load(path: &std::path::Path) -> Result<Self> {
         Ok(serde_json::from_slice(&std::fs::read(path)?)?)
     }
+    pub fn load_secure(path: &std::path::Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(path)?.permissions();
+            if permissions.mode() & 0o077 != 0 {
+                permissions.set_mode(0o600);
+                std::fs::set_permissions(path, permissions)?;
+            }
+        }
+        Self::load(path)
+    }
     pub fn signing_key(&self) -> Result<SigningKey> {
-        let bytes = b64.decode(&self.secret_key)?;
-        let arr: [u8; 64] = bytes.try_into().map_err(|_| anyhow!("bad key bytes"))?;
+        let bytes = Zeroizing::new(b64.decode(&self.secret_key)?);
+        let arr: [u8; 64] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("bad key bytes"))?;
         Ok(SigningKey::from_keypair_bytes(&arr)?)
     }
     pub fn sign_bytes(&self, payload: &[u8]) -> Result<String> {
@@ -139,8 +169,8 @@ impl Envelope {
         Ok(Self {
             id,
             channel: channel.to_string(),
-            from: kf.public_key,
-            from_alias: kf.alias,
+            from: kf.public_key.clone(),
+            from_alias: kf.alias.clone(),
             ts: msg.ts,
             sig: hex::encode(sig.to_bytes()),
             msg,
@@ -155,6 +185,13 @@ impl Envelope {
     /// 2. The `id` field matches blake3(serde_json(msg)) — closing the
     ///    lying-id gap.
     pub fn verify(&self) -> Result<()> {
+        if self.ts != self.msg.ts {
+            return Err(anyhow!(
+                "envelope timestamp {} does not match signed message timestamp {}",
+                self.ts,
+                self.msg.ts
+            ));
+        }
         // ── recompute signed payload (channel || '\n' || msg_bytes) ──
         let msg_bytes = serde_json::to_vec(&self.msg)?;
         let channel_bytes = self.channel.as_bytes();
@@ -276,6 +313,14 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_envelope_timestamp_cannot_be_rewritten() {
+        let kp = make_keypair("alice");
+        let mut env = Envelope::sign(kp, "tech/test", make_msg("hello")).unwrap();
+        env.ts += 1;
+        assert!(env.verify().is_err());
+    }
+
+    #[test]
     fn keypair_generate_roundtrip() {
         let kp = KeypairFile::generate(Some("bob".into()));
         let temp = std::env::temp_dir().join("embernet_test_keypair.json");
@@ -291,5 +336,43 @@ mod tests {
             sk1.verifying_key().as_bytes(),
             sk2.verifying_key().as_bytes()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keypair_file_is_owner_readable_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let kp = KeypairFile::generate(Some("secure".into()));
+        let temp = std::env::temp_dir().join(format!(
+            "embernet_secure_identity_{:016x}.json",
+            rand::random::<u64>()
+        ));
+        kp.save(&temp).unwrap();
+        assert_eq!(
+            std::fs::metadata(&temp).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_file(temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_load_repairs_existing_identity_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let kp = KeypairFile::generate(Some("legacy".into()));
+        let temp = std::env::temp_dir().join(format!(
+            "embernet_legacy_identity_{:016x}.json",
+            rand::random::<u64>()
+        ));
+        std::fs::write(&temp, serde_json::to_vec(&kp).unwrap()).unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        KeypairFile::load_secure(&temp).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&temp).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_file(temp);
     }
 }

@@ -12,11 +12,23 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::path::Path;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::{Zeroize, Zeroizing};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Zeroize)]
+#[zeroize(drop)]
 pub struct ChannelKey {
     pub id: String,
     pub key: String,
+}
+
+impl std::fmt::Debug for ChannelKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChannelKey")
+            .field("id", &self.id)
+            .field("key", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,24 +80,29 @@ pub fn load_keys(base: &Path, channel: &str) -> Result<Vec<ChannelKey>> {
 
 fn save_keys(base: &Path, channel: &str, keys: &[ChannelKey]) -> Result<()> {
     let path = keyring_path(base, channel);
-    let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, serde_json::to_vec_pretty(keys)?)?;
+    let temp = path.with_extension(format!("json.tmp-{:016x}", rand::random::<u64>()));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = options.open(&temp)?;
+    use std::io::Write;
+    file.write_all(&serde_json::to_vec_pretty(keys)?)?;
+    file.sync_all()?;
     std::fs::rename(temp, path)?;
     Ok(())
 }
 
 pub fn generate_channel_key(base: &Path, channel: &str) -> Result<ChannelKey> {
     let _lock = lock_keyring(base, channel)?;
-    let mut raw = [0_u8; 32];
-    OsRng.fill_bytes(&mut raw);
+    let mut raw = Zeroizing::new([0_u8; 32]);
+    OsRng.fill_bytes(&mut *raw);
     let key = ChannelKey {
-        id: hex::encode(blake3::hash(&raw).as_bytes()),
-        key: b64.encode(raw),
+        id: hex::encode(blake3::hash(&*raw).as_bytes()),
+        key: b64.encode(raw.as_slice()),
     };
     let mut keys = load_keys(base, channel)?;
     keys.retain(|existing| existing.id != key.id);
@@ -101,7 +118,8 @@ pub fn current_channel_key(base: &Path, channel: &str) -> Result<ChannelKey> {
 }
 
 fn decode_key(key: &ChannelKey) -> Result<[u8; 32]> {
-    b64.decode(&key.key)?
+    Zeroizing::new(b64.decode(&key.key)?)
+        .as_slice()
         .try_into()
         .map_err(|_| anyhow::anyhow!("channel key must contain 32 bytes"))
 }
@@ -112,14 +130,14 @@ fn message_aad(channel: &str, key_id: &str) -> Vec<u8> {
 
 pub fn encrypt_message(base: &Path, channel: &str, mut message: Message) -> Result<Message> {
     let key = current_channel_key(base, channel)?;
-    let raw_key = decode_key(&key)?;
+    let raw_key = Zeroizing::new(decode_key(&key)?);
     let plaintext = match message.body {
         Body::Text { text } => text.into_bytes(),
         Body::Encrypted { .. } => bail!("message is already encrypted"),
     };
     let mut nonce = [0_u8; 24];
     OsRng.fill_bytes(&mut nonce);
-    let ciphertext = XChaCha20Poly1305::new((&raw_key).into())
+    let ciphertext = XChaCha20Poly1305::new((&*raw_key).into())
         .encrypt(
             XNonce::from_slice(&nonce),
             Payload {
@@ -129,7 +147,7 @@ pub fn encrypt_message(base: &Path, channel: &str, mut message: Message) -> Resu
         )
         .map_err(|_| anyhow::anyhow!("encrypt private-channel message"))?;
     message.body = Body::Encrypted {
-        key_id: key.id,
+        key_id: key.id.clone(),
         nonce: b64.encode(nonce),
         ciphertext: b64.encode(ciphertext),
     };
@@ -149,13 +167,13 @@ pub fn decrypt_envelope(base: &Path, envelope: &Envelope) -> Result<Envelope> {
         .into_iter()
         .find(|key| key.id == *key_id)
         .with_context(|| format!("missing decryption key {}", key_id))?;
-    let raw_key = decode_key(&key)?;
+    let raw_key = Zeroizing::new(decode_key(&key)?);
     let nonce: [u8; 24] = b64
         .decode(nonce)?
         .try_into()
         .map_err(|_| anyhow::anyhow!("encrypted message nonce must contain 24 bytes"))?;
     let ciphertext = b64.decode(ciphertext)?;
-    let plaintext = XChaCha20Poly1305::new((&raw_key).into())
+    let plaintext = XChaCha20Poly1305::new((&*raw_key).into())
         .decrypt(
             XNonce::from_slice(&nonce),
             Payload {
@@ -199,7 +217,10 @@ fn offer_wrap_key(
     key_id: &str,
 ) -> Result<[u8; 32]> {
     let shared = x25519_secret(identity)?.diffie_hellman(&x25519_public(other)?);
-    let mut material = b"embernet-key-wrap-v1\n".to_vec();
+    if !shared.was_contributory() {
+        bail!("refusing non-contributory X25519 key exchange");
+    }
+    let mut material = Zeroizing::new(b"embernet-key-wrap-v1\n".to_vec());
     material.extend_from_slice(shared.as_bytes());
     material.extend_from_slice(channel.as_bytes());
     material.push(b'\n');
@@ -220,15 +241,15 @@ pub fn make_key_offers(
     load_keys(base, channel)?
         .into_iter()
         .map(|key| {
-            let raw = decode_key(&key)?;
-            let wrap_key = offer_wrap_key(sender, recipient, channel, &key.id)?;
+            let raw = Zeroizing::new(decode_key(&key)?);
+            let wrap_key = Zeroizing::new(offer_wrap_key(sender, recipient, channel, &key.id)?);
             let mut nonce = [0_u8; 24];
             OsRng.fill_bytes(&mut nonce);
-            let ciphertext = XChaCha20Poly1305::new((&wrap_key).into())
+            let ciphertext = XChaCha20Poly1305::new((&*wrap_key).into())
                 .encrypt(
                     XNonce::from_slice(&nonce),
                     Payload {
-                        msg: &raw,
+                        msg: raw.as_slice(),
                         aad: &offer_aad(channel, &key.id, &sender.public_key, recipient),
                     },
                 )
@@ -247,7 +268,7 @@ pub fn make_key_offers(
             signed.extend_from_slice(&serde_json::to_vec(&payload)?);
             Ok(KeyOffer {
                 channel: channel.to_string(),
-                key_id: key.id,
+                key_id: key.id.clone(),
                 sender: sender.public_key.clone(),
                 recipient: recipient.to_string(),
                 nonce,
@@ -282,21 +303,28 @@ pub fn accept_key_offers(
         let mut signed = b"embernet-key-offer-signature-v1\n".to_vec();
         signed.extend_from_slice(&serde_json::to_vec(&payload)?);
         verify_bytes(&offer.sender, &offer.sig, &signed)?;
-        let wrap_key = offer_wrap_key(recipient, &offer.sender, channel, &offer.key_id)?;
+        let wrap_key = Zeroizing::new(offer_wrap_key(
+            recipient,
+            &offer.sender,
+            channel,
+            &offer.key_id,
+        )?);
         let nonce: [u8; 24] = b64
             .decode(&offer.nonce)?
             .try_into()
             .map_err(|_| anyhow::anyhow!("key offer nonce must contain 24 bytes"))?;
         let ciphertext = b64.decode(&offer.ciphertext)?;
-        let raw = XChaCha20Poly1305::new((&wrap_key).into())
-            .decrypt(
-                XNonce::from_slice(&nonce),
-                Payload {
-                    msg: &ciphertext,
-                    aad: &offer_aad(channel, &offer.key_id, &offer.sender, &offer.recipient),
-                },
-            )
-            .map_err(|_| anyhow::anyhow!("unwrap channel key"))?;
+        let raw = Zeroizing::new(
+            XChaCha20Poly1305::new((&*wrap_key).into())
+                .decrypt(
+                    XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: &ciphertext,
+                        aad: &offer_aad(channel, &offer.key_id, &offer.sender, &offer.recipient),
+                    },
+                )
+                .map_err(|_| anyhow::anyhow!("unwrap channel key"))?,
+        );
         if raw.len() != 32 {
             bail!("unwrapped channel key must contain 32 bytes");
         }

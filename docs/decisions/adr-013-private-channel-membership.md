@@ -34,7 +34,9 @@ policy authorizes that identity to read.
 - Existing policy JSON without the new fields remains public and has no readers.
 - Reader membership and visibility federate through the existing signed policy
   chain and fork rules.
-- Timestamps limit replay of discovery and sync authentication to 60 seconds.
+- Timestamps initially limited replay of discovery and sync authentication to 60
+  seconds. [[adr-015-protocol-hardening]] supersedes this with one-time,
+  responder-bound challenges.
 - Private content is still plaintext on disk and in process memory.
 - Revocation prevents future discovery and synchronization but cannot erase data
   that a former member already synchronized.

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -43,6 +44,7 @@ pub fn list_peers(datadir: &Path) -> Result<Vec<String>> {
 
 pub fn add_peer(datadir: &Path, value: &str) -> Result<String> {
     let peer = normalize_peer_url(value)?;
+    let _lock = lock_config(datadir)?;
     let mut peers = list_peers(datadir)?;
     if !peers.contains(&peer) {
         peers.push(peer.clone());
@@ -53,12 +55,28 @@ pub fn add_peer(datadir: &Path, value: &str) -> Result<String> {
 
 pub fn remove_peer(datadir: &Path, value: &str) -> Result<bool> {
     let peer = normalize_peer_url(value)?;
+    let _lock = lock_config(datadir)?;
     let mut peers = list_peers(datadir)?;
     let original_len = peers.len();
     peers.retain(|candidate| candidate != &peer);
     let removed = peers.len() != original_len;
     write_peers(datadir, peers)?;
     Ok(removed)
+}
+
+fn lock_config(datadir: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(datadir)
+        .with_context(|| format!("create data directory {}", datadir.display()))?;
+    let path = datadir.join("peers.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    file.lock_exclusive()
+        .with_context(|| format!("lock {}", path.display()))?;
+    Ok(file)
 }
 
 fn write_peers(datadir: &Path, mut peers: Vec<String>) -> Result<()> {
@@ -68,7 +86,7 @@ fn write_peers(datadir: &Path, mut peers: Vec<String>) -> Result<()> {
     peers.dedup();
     let config = PeerConfig { version: 1, peers };
     let path = config_path(datadir);
-    let temporary = datadir.join("peers.json.tmp");
+    let temporary = datadir.join(format!("peers.json.tmp-{:016x}", rand::random::<u64>()));
     let mut bytes = serde_json::to_vec_pretty(&config)?;
     bytes.push(b'\n');
     std::fs::write(&temporary, bytes).with_context(|| format!("write {}", temporary.display()))?;
@@ -107,5 +125,30 @@ mod tests {
     fn peer_url_rejects_non_websocket_schemes() {
         assert!(normalize_peer_url("https://localhost:4444").is_err());
         assert!(normalize_peer_url("not a URL").is_err());
+    }
+
+    #[test]
+    fn concurrent_peer_updates_do_not_clobber_each_other() {
+        let datadir = temp_dir();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let threads = ["ws://localhost:4444/sync", "ws://localhost:4445/sync"]
+            .into_iter()
+            .map(|peer| {
+                let datadir = datadir.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    add_peer(&datadir, peer).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            list_peers(&datadir).unwrap(),
+            vec!["ws://localhost:4444/sync", "ws://localhost:4445/sync"]
+        );
     }
 }

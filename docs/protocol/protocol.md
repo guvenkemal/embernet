@@ -219,15 +219,24 @@ The response contains `{"ok":true,"channels":[...]}`. Clients may use this list 
 create missing local channel shells before synchronizing. Anonymous requests see
 only public channels.
 
-Authenticated clients send `x-embernet-public-key`, `x-embernet-timestamp`, and
-`x-embernet-signature` headers. The signature covers:
+Authenticated clients first request a one-time challenge:
 
 ```text
-embernet-discovery-v1\n<unix timestamp>\n/status
+GET /challenge
 ```
 
-Valid signatures no more than 60 seconds old reveal private channels for which the
-signed policy recognizes that identity as owner, moderator, writer, or reader.
+The response contains a random 32-byte hexadecimal `nonce`, the responder's
+identity, and an expiry. The client then sends `x-embernet-public-key`,
+`x-embernet-timestamp`, `x-embernet-nonce`, and `x-embernet-signature` headers to
+`GET /status`. The signature covers:
+
+```text
+embernet-discovery-v2\n<unix timestamp>\n/status\n<nonce>\n<responder>
+```
+
+The responder consumes a valid nonce once. Valid, unexpired challenges reveal
+private channels for which the signed policy recognizes that identity as owner,
+moderator, writer, or reader.
 
 The current sync protocol is implemented over WebSocket at:
 
@@ -235,11 +244,25 @@ The current sync protocol is implemented over WebSocket at:
 GET /sync
 ```
 
-Sync v7 reconciles one channel per connection. The opening packet authenticates
-the requester with a timestamped signature bound to the channel. Private channels
+Sync v8 reconciles one channel per connection. The responder first sends a
+socket-specific challenge:
+
+```json
+{
+  "type": "challenge",
+  "nonce": "32-byte-hex-nonce",
+  "responder": "responder-public-key-hex",
+  "expires": 1784990060
+}
+```
+
+The opening client packet authenticates the requester with a signature bound to
+the timestamp, channel, nonce, and responder. Private channels
 reject non-members before returning policy or message data. Before message reconciliation, the
 initiator sends its complete signed policy history. Peers accept verified prefix
 extensions; a fork is saved under `policy-conflicts/` and aborts message sync.
+Membership is checked again against the reconciled policy before administrative
+history or channel keys are returned.
 
 After policy agreement, peers reconcile their signed moderation event chains using
 the same prefix-only rule. Valid forks are saved under `moderation-conflicts/` and
@@ -258,7 +281,7 @@ into 256 buckets. Each bucket hash is BLAKE3 over its lexicographically sorted r
 ```json
 {
   "type": "status",
-  "version": 7,
+  "version": 8,
   "channel": "tech/linux",
   "requester": "ed25519-public-key-hex",
   "auth_ts": 1784990000,
@@ -274,11 +297,11 @@ Fields:
 | Field | Type | Description |
 | --- | --- | --- |
 | `type` | string | Must be `"status"`. |
-| `version` | integer | Must be `7`. |
+| `version` | integer | Must be `8`. |
 | `channel` | string | Channel to synchronize. |
 | `requester` | string | Ed25519 public key of the initiating node. |
 | `auth_ts` | integer | Unix timestamp, accepted within 60 seconds. |
-| `auth_sig` | string | Signature over `embernet-sync-auth-v1\n<timestamp>\n<channel>`. |
+| `auth_sig` | string | Signature over `embernet-sync-auth-v2\n<timestamp>\n<channel>\n<nonce>\n<responder>`. |
 | `policy_events` | array | Complete signed policy-event chain. |
 | `moderation_events` | array | Complete signed moderation-event chain. |
 | `chunks` | array | Non-empty bucket summaries: prefix index, ID count, and hash. |
@@ -330,7 +353,7 @@ so retrying a partially completed sync is safe.
 - Revoked members retain data and historical keys synchronized before revocation.
 - Channel membership and visibility are visible to authorized peers in policy
   history.
-- Sync v6 peers are not wire-compatible with v7.
+- Sync v7 peers are not wire-compatible with v8.
 - Policy histories are sent in full before every exchange.
 - Moderation histories are sent in full before every exchange.
 - Historical messages are authorized against current policy state rather than the

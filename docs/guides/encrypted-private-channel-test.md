@@ -31,7 +31,7 @@ cd ~/Projects/embernet
 cargo build
 ```
 
-All nodes must run the same build. Sync v7 is not compatible with earlier sync
+All nodes must run the same build. Sync v8 is not compatible with earlier sync
 versions.
 
 ## 3. Reset the test data

@@ -11,16 +11,27 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-const SYNC_VERSION: u32 = 7;
+const SYNC_VERSION: u32 = 8;
 const MAX_DIFFERING_IDS: usize = 100_000;
 const MAX_POLICY_EVENTS: usize = 10_000;
 const MAX_MODERATION_EVENTS: usize = 100_000;
 const MAX_KEY_OFFERS: usize = 4_096;
 const MAX_DISCOVERED_CHANNELS: usize = 10_000;
 const MAX_STATUS_BYTES: usize = 1_048_576;
+const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 pub(crate) const DISCOVERY_KEY_HEADER: &str = "x-embernet-public-key";
 pub(crate) const DISCOVERY_TIMESTAMP_HEADER: &str = "x-embernet-timestamp";
 pub(crate) const DISCOVERY_SIGNATURE_HEADER: &str = "x-embernet-signature";
+pub(crate) const DISCOVERY_NONCE_HEADER: &str = "x-embernet-nonce";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AuthChallenge {
+    #[serde(rename = "type", default)]
+    msg_type: String,
+    nonce: String,
+    responder: String,
+    expires: i64,
+}
 
 #[derive(Debug, Deserialize)]
 struct PeerStatus {
@@ -131,12 +142,22 @@ impl SyncResponse {
 
 pub async fn handle_sync(ws: WebSocket, state: Arc<AppState>) {
     tracing::info!("sync: new websocket connection");
-    if let Err(error) = run_sync(ws, &state.datadir).await {
+    if let Err(error) = run_sync(ws, &state).await {
         tracing::error!("sync session failed: {error:#}");
     }
 }
 
-async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
+async fn run_sync(mut ws: WebSocket, state: &AppState) -> Result<()> {
+    let datadir = &state.datadir;
+    let challenge = AuthChallenge {
+        msg_type: "challenge".into(),
+        nonce: hex::encode(rand::random::<[u8; 32]>()),
+        responder: state.responder.clone(),
+        expires: chrono::Utc::now().timestamp() + 60,
+    };
+    ws.send(Message::Text(serde_json::to_string(&challenge)?))
+        .await
+        .context("send sync authentication challenge")?;
     let status = read_status(&mut ws).await?;
     if status.version != SYNC_VERSION {
         bail!("unsupported sync version: {}", status.version);
@@ -159,10 +180,18 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
     if (chrono::Utc::now().timestamp() - status.auth_ts).abs() > 60 {
         bail!("stale sync authentication");
     }
+    if challenge.expires < chrono::Utc::now().timestamp() {
+        bail!("expired sync authentication challenge");
+    }
     verify_bytes(
         &status.requester,
         &status.auth_sig,
-        &sync_auth_payload(status.auth_ts, &status.channel),
+        &sync_auth_payload(
+            status.auth_ts,
+            &status.channel,
+            &challenge.nonce,
+            &challenge.responder,
+        ),
     )
     .context("invalid sync authentication")?;
     store::validate_policy_history(&chan, &status.policy_events)?;
@@ -188,6 +217,13 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
     }
     if local_prefix && status.policy_events.len() > local_policy.len() {
         store::append_remote_policy_history(datadir, &chan, &status.policy_events)?;
+    }
+    let reconciled_policy_state = store::read_channel_policy(datadir, &chan)?;
+    if !store::policy_allows_read(&reconciled_policy_state, &status.requester) {
+        bail!(
+            "requester is not a member of private channel {} after policy reconciliation",
+            chan.full_name
+        );
     }
     let reconciled_policy = store::read_policy_history(datadir, &chan)?;
     ws.send(Message::Text(serde_json::to_string(&PolicySync {
@@ -222,8 +258,11 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
     .await
     .context("send moderation sync")?;
     let policy = store::read_channel_policy(datadir, &chan)?;
+    if !store::policy_allows_read(&policy, &status.requester) {
+        bail!("requester is not authorized to receive channel keys");
+    }
     let server_identity = if policy.visibility == store::ChannelVisibility::Private {
-        let identity = KeypairFile::load(&datadir.join("keys/identity.json"))
+        let identity = KeypairFile::load_secure(&datadir.join("keys/identity.json"))
             .context("load server identity for private channel-key exchange")?;
         if !store::policy_allows_read(&policy, &identity.public_key) {
             bail!("serving identity is not a member of private channel");
@@ -351,17 +390,15 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
             .context("send envelope")?;
     }
 
-    let wanted: HashSet<String> = wanted_from_client.into_iter().collect();
+    let mut wanted: HashSet<String> = wanted_from_client.into_iter().collect();
     let mut received = 0_u64;
-    while received < wanted.len() as u64 {
+    while !wanted.is_empty() {
         let msg = ws.next().await.context("peer closed during upload")??;
         let Message::Text(text) = msg else {
             continue;
         };
         let env: Envelope = serde_json::from_str(&text).context("deserialize uploaded envelope")?;
-        if !wanted.contains(&env.id) {
-            bail!("client uploaded unrequested envelope {}", env.id);
-        }
+        accept_requested_id(&mut wanted, &env.id)?;
         if env.channel != chan.full_name {
             bail!("uploaded envelope {} belongs to {}", env.id, env.channel);
         }
@@ -378,6 +415,13 @@ async fn run_sync(mut ws: WebSocket, datadir: &Path) -> Result<()> {
     .await
     .context("send complete")?;
     tracing::info!("sync: sent {sent}, received {received}");
+    Ok(())
+}
+
+fn accept_requested_id(wanted: &mut HashSet<String>, id: &str) -> Result<()> {
+    if !wanted.remove(id) {
+        bail!("client uploaded unrequested envelope {id}");
+    }
     Ok(())
 }
 
@@ -464,16 +508,33 @@ fn validate_key_offers(sync: &KeySync) -> Result<()> {
 }
 
 pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Result<u64> {
+    tokio::time::timeout(
+        SYNC_TIMEOUT,
+        sync_from_peer_inner(datadir, peer_url, channel),
+    )
+    .await
+    .context("peer synchronization timed out")?
+}
+
+async fn sync_from_peer_inner(datadir: &Path, peer_url: &str, channel: &str) -> Result<u64> {
     use tokio_tungstenite::connect_async;
 
     let chan = ChannelRef::parse(channel)?;
     let local_chunks = store::chunk_summaries(datadir, &chan)?;
     let policy_events = store::read_policy_history(datadir, &chan)?;
     let moderation_events = store::read_moderation_history(datadir, &chan)?;
-    let identity = KeypairFile::load(&datadir.join("keys/identity.json"))
+    let identity = KeypairFile::load_secure(&datadir.join("keys/identity.json"))
         .context("load identity for synchronization")?;
     let auth_ts = chrono::Utc::now().timestamp();
-    let auth_sig = identity.sign_bytes(&sync_auth_payload(auth_ts, channel))?;
+
+    let (mut ws, _) = connect_async(peer_url).await.context("connect to peer")?;
+    let challenge = read_client_challenge(&mut ws).await?;
+    let auth_sig = identity.sign_bytes(&sync_auth_payload(
+        auth_ts,
+        channel,
+        &challenge.nonce,
+        &challenge.responder,
+    ))?;
     let status = serde_json::json!({
         "type": "status",
         "version": SYNC_VERSION,
@@ -485,8 +546,6 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
         "moderation_events": moderation_events,
         "chunks": local_chunks,
     });
-
-    let (mut ws, _) = connect_async(peer_url).await.context("connect to peer")?;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         status.to_string(),
     ))
@@ -637,12 +696,41 @@ pub async fn sync_from_peer(datadir: &Path, peer_url: &str, channel: &str) -> Re
     Ok(received)
 }
 
-fn sync_auth_payload(timestamp: i64, channel: &str) -> Vec<u8> {
-    format!("embernet-sync-auth-v1\n{timestamp}\n{channel}").into_bytes()
+async fn read_client_challenge(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Result<AuthChallenge> {
+    let message = ws
+        .next()
+        .await
+        .context("peer closed before authentication challenge")??;
+    let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
+        bail!("expected text authentication challenge");
+    };
+    let challenge: AuthChallenge =
+        serde_json::from_str(&text).context("invalid authentication challenge")?;
+    if challenge.msg_type != "challenge" {
+        bail!("expected type=challenge");
+    }
+    if challenge.expires < chrono::Utc::now().timestamp()
+        || challenge.expires > chrono::Utc::now().timestamp() + 60
+    {
+        bail!("invalid authentication challenge expiry");
+    }
+    let nonce = hex::decode(&challenge.nonce).context("invalid challenge nonce")?;
+    if nonce.len() != 32 {
+        bail!("challenge nonce must contain 32 bytes");
+    }
+    Ok(challenge)
 }
 
-pub(crate) fn discovery_auth_payload(timestamp: i64) -> Vec<u8> {
-    format!("embernet-discovery-v1\n{timestamp}\n/status").into_bytes()
+fn sync_auth_payload(timestamp: i64, channel: &str, nonce: &str, responder: &str) -> Vec<u8> {
+    format!("embernet-sync-auth-v2\n{timestamp}\n{channel}\n{nonce}\n{responder}").into_bytes()
+}
+
+pub(crate) fn discovery_auth_payload(timestamp: i64, nonce: &str, responder: &str) -> Vec<u8> {
+    format!("embernet-discovery-v2\n{timestamp}\n/status\n{nonce}\n{responder}").into_bytes()
 }
 
 pub async fn discover_peer_channels(datadir: &Path, peer_url: &str) -> Result<Vec<String>> {
@@ -660,15 +748,38 @@ pub async fn discover_peer_channels(datadir: &Path, peer_url: &str) -> Result<Ve
     status_url.set_query(None);
     status_url.set_fragment(None);
 
-    let identity = KeypairFile::load(&datadir.join("keys/identity.json"))
+    let identity = KeypairFile::load_secure(&datadir.join("keys/identity.json"))
         .context("load identity for channel discovery")?;
+    let mut challenge_url = status_url.clone();
+    challenge_url.set_path("/challenge");
+    let challenge: AuthChallenge = reqwest::Client::new()
+        .get(challenge_url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .context("request discovery challenge")?
+        .error_for_status()
+        .context("discovery challenge returned an error")?
+        .json()
+        .await
+        .context("decode discovery challenge")?;
+    if challenge.expires < chrono::Utc::now().timestamp()
+        || challenge.expires > chrono::Utc::now().timestamp() + 60
+    {
+        bail!("invalid discovery challenge expiry");
+    }
     let timestamp = chrono::Utc::now().timestamp();
-    let signature = identity.sign_bytes(&discovery_auth_payload(timestamp))?;
+    let signature = identity.sign_bytes(&discovery_auth_payload(
+        timestamp,
+        &challenge.nonce,
+        &challenge.responder,
+    ))?;
     let response = reqwest::Client::new()
         .get(status_url)
         .header(DISCOVERY_KEY_HEADER, &identity.public_key)
         .header(DISCOVERY_TIMESTAMP_HEADER, timestamp.to_string())
         .header(DISCOVERY_SIGNATURE_HEADER, signature)
+        .header(DISCOVERY_NONCE_HEADER, challenge.nonce)
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
@@ -748,6 +859,14 @@ mod tests {
         .unwrap();
         append_message(base, chan, &env).unwrap();
         env.id
+    }
+
+    #[test]
+    fn duplicate_upload_cannot_satisfy_distinct_wanted_ids() {
+        let mut wanted = HashSet::from(["first".to_string(), "second".to_string()]);
+        accept_requested_id(&mut wanted, "first").unwrap();
+        assert!(accept_requested_id(&mut wanted, "first").is_err());
+        assert_eq!(wanted, HashSet::from(["second".to_string()]));
     }
 
     fn ensure_identity(base: &Path) -> KeypairFile {
@@ -919,7 +1038,8 @@ mod tests {
 
         let key_before_revoke = crate::crypto::current_channel_key(&server_dir, &chan.full_name)
             .unwrap()
-            .id;
+            .id
+            .clone();
         store::revoke_role(
             &server_dir,
             &chan,
@@ -959,6 +1079,58 @@ mod tests {
                 .is_err()
         );
         assert_ne!(member.public_key, outsider.public_key);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn reconciled_revocation_blocks_channel_key_delivery() {
+        let server_dir = temp_dir("stale_private_server");
+        let client_dir = temp_dir("revoked_private_client");
+        for dir in [&server_dir, &client_dir] {
+            init_layout(dir).unwrap();
+        }
+        let owner = KeypairFile::generate(Some("owner".into()));
+        owner.save(&server_dir.join("keys/identity.json")).unwrap();
+        let member = ensure_identity(&client_dir);
+        let chan = ChannelRef::parse("private/stale-policy").unwrap();
+        create_channel(&server_dir, &chan).unwrap();
+        restrict_channel(&server_dir, &chan, &owner).unwrap();
+        grant_role(
+            &server_dir,
+            &chan,
+            &owner,
+            PolicyRole::Reader,
+            &member.public_key,
+        )
+        .unwrap();
+        set_channel_visibility(&server_dir, &chan, &owner, ChannelVisibility::Private).unwrap();
+
+        create_channel(&client_dir, &chan).unwrap();
+        copy_policy_history(&server_dir, &client_dir, &chan);
+        crate::store::rebuild_policy_cache(&client_dir, &chan).unwrap();
+        crate::store::revoke_role(
+            &client_dir,
+            &chan,
+            &owner,
+            PolicyRole::Reader,
+            &member.public_key,
+        )
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::server::router(server_dir.clone());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        assert!(
+            sync_from_peer(&client_dir, &format!("ws://{addr}/sync"), &chan.full_name)
+                .await
+                .is_err()
+        );
+        assert!(!store::policy_allows_read(
+            &store::read_channel_policy(&server_dir, &chan).unwrap(),
+            &member.public_key
+        ));
         task.abort();
     }
 
