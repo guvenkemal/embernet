@@ -33,10 +33,14 @@ curl http://127.0.0.1:4444/status | jq
 ./target/debug/embernet --data ~/.embernet-test-2 init --alias "Peer"
 
 # 7) save the first node as its peer
-./target/debug/embernet --data ~/.embernet-test-2 peer-add ws://127.0.0.1:4444/sync
+first_key=$(jq -r .public_key ~/.embernet-test/keys/identity.json)
+./target/debug/embernet --data ~/.embernet-test-2 \
+  peer-add ws://127.0.0.1:4444/sync --public-key "$first_key"
 
 # 8) save the second node on the first for symmetric reconnection
-./target/debug/embernet --data ~/.embernet-test peer-add ws://127.0.0.1:4445/sync
+second_key=$(jq -r .public_key ~/.embernet-test-2/keys/identity.json)
+./target/debug/embernet --data ~/.embernet-test \
+  peer-add ws://127.0.0.1:4445/sync --public-key "$second_key"
 
 # 9) open the second terminal client; it discovers and syncs the channel
 ./target/debug/embernet --data ~/.embernet-test-2 tui --listen 127.0.0.1:4445
@@ -54,6 +58,26 @@ To import an existing identity instead of generating one:
 The imported source file is left unchanged. Embernet always uses
 `<data-directory>/keys/identity.json` as the node's canonical identity and refuses
 to overwrite it during a later `init`.
+
+### Peer identity pinning
+
+Exchange node identities through a trusted side channel before saving peers:
+
+```bash
+# run on Alice's machine and send the public key to Bob
+embernet --data ~/.embernet-alice identity
+
+# run on Bob's machine
+embernet --data ~/.embernet-bob \
+  peer-add ws://alice.example:4444/sync \
+  --public-key <alice-public-key>
+```
+
+Discovery and sync verify Alice's signed challenge against that pin. If the
+responder identity changes, Embernet fails closed. To intentionally replace a
+peer identity, remove the peer, verify the new key independently, and add it
+again. Legacy URL-only `peers.json` entries appear as `UNPINNED` in `peer-list`
+and must be pinned before automatic synchronization resumes.
 
 ## Protocol
 
@@ -74,6 +98,7 @@ Full specification: `docs/protocol/protocol.md`
 ```
 embernet keygen           Export a standalone ed25519 identity keypair
 embernet init             Initialise a node by generating or importing its identity
+embernet identity         Show the local public identity used for peer pinning
 embernet channel-create   Create a channel
 embernet channel-policy   Show a channel's local write policy
 embernet channel-policy-history Show verified signed policy events
@@ -94,7 +119,7 @@ embernet post             Post a signed text message
 embernet tail             Tail recent messages from a channel
 embernet serve            Run HTTP/WebSocket server (status + sync)
 embernet sync             Reconcile messages bidirectionally via Have/Want
-embernet peer-add         Save a peer for automatic synchronization
+embernet peer-add         Save a peer URL and pin its expected identity
 embernet peer-list        List saved peers
 embernet peer-remove      Remove a saved peer
 embernet tui              Open the terminal client, optionally accepting connections
@@ -110,6 +135,7 @@ embernet mcp              Run as an MCP stdio server for AI clients
   private message bodies are encrypted before entering the append-only log.
 - File-backed — no external database required.
 - Saved peers provide remote channel discovery and periodic TUI synchronization.
+- Saved peers pin the responder's Ed25519 identity and reject unexpected changes.
 - The TUI can host the HTTP/WebSocket server with `--listen`.
 - AI-agent integration via MCP.
 

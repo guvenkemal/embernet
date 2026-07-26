@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 
 pub struct AppState {
     pub datadir: PathBuf,
-    pub responder: String,
+    pub identity: KeypairFile,
     discovery_challenges: std::sync::Mutex<HashMap<String, i64>>,
 }
 
@@ -27,13 +27,6 @@ pub struct AppState {
 struct Status {
     ok: bool,
     channels: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct Challenge {
-    nonce: String,
-    responder: String,
-    expires: i64,
 }
 
 pub struct ServerHandle {
@@ -86,7 +79,9 @@ pub async fn start(datadir: PathBuf, listen: &str) -> Result<ServerHandle> {
         .await
         .with_context(|| format!("bind {requested}"))?;
     let addr = listener.local_addr()?;
-    let app = router(datadir);
+    let identity = KeypairFile::load_secure(&datadir.join("keys/identity.json"))
+        .context("load server identity")?;
+    let app = router_with_identity(datadir, identity);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -109,13 +104,17 @@ pub async fn run(datadir: PathBuf, listen: String) -> Result<()> {
     server.wait().await
 }
 
+#[cfg(test)]
 pub(crate) fn router(datadir: PathBuf) -> Router {
-    let responder = KeypairFile::load_secure(&datadir.join("keys/identity.json"))
-        .map(|identity| identity.public_key.clone())
-        .unwrap_or_else(|_| hex::encode(rand::random::<[u8; 32]>()));
+    let identity = KeypairFile::load_secure(&datadir.join("keys/identity.json"))
+        .unwrap_or_else(|_| KeypairFile::generate(Some("ephemeral test responder".into())));
+    router_with_identity(datadir, identity)
+}
+
+fn router_with_identity(datadir: PathBuf, identity: KeypairFile) -> Router {
     let state = AppState {
         datadir,
-        responder,
+        identity,
         discovery_challenges: std::sync::Mutex::new(HashMap::new()),
     };
     Router::new()
@@ -127,8 +126,16 @@ pub(crate) fn router(datadir: PathBuf) -> Router {
 
 async fn challenge(State(state): State<Arc<AppState>>) -> Response {
     const MAX_DISCOVERY_CHALLENGES: usize = 10_000;
-    let nonce = hex::encode(rand::random::<[u8; 32]>());
-    let expires = chrono::Utc::now().timestamp() + 60;
+    let challenge = match sync::make_auth_challenge(&state.identity, "/status") {
+        Ok(challenge) => challenge,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
     let mut challenges = match state.discovery_challenges.lock() {
         Ok(challenges) => challenges,
         Err(_) => {
@@ -148,13 +155,8 @@ async fn challenge(State(state): State<Arc<AppState>>) -> Response {
         )
             .into_response();
     }
-    challenges.insert(nonce.clone(), expires);
-    Json(Challenge {
-        nonce,
-        responder: state.responder.clone(),
-        expires,
-    })
-    .into_response()
+    challenges.insert(challenge.nonce.clone(), challenge.expires);
+    Json(challenge).into_response()
 }
 
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -210,7 +212,7 @@ fn discovery_requester(state: &AppState, headers: &HeaderMap) -> Result<Option<S
     verify_bytes(
         key,
         signature,
-        &sync::discovery_auth_payload(timestamp, nonce, &state.responder),
+        &sync::discovery_auth_payload(timestamp, nonce, &state.identity.public_key),
     )
     .context("invalid discovery signature")?;
     challenges.remove(nonce);
@@ -235,6 +237,9 @@ mod tests {
         let datadir = std::env::temp_dir().join("embernet_managed_server_test");
         let _ = std::fs::remove_dir_all(&datadir);
         crate::store::init_layout(&datadir).unwrap();
+        KeypairFile::generate(Some("server".into()))
+            .save(&datadir.join("keys/identity.json"))
+            .unwrap();
         let server = start(datadir, "127.0.0.1:0").await.unwrap();
         let status_url = format!("http://{}/status", server.local_addr());
 
@@ -262,14 +267,15 @@ mod tests {
     fn discovery_challenge_is_consumed_once() {
         let identity = KeypairFile::generate(Some("alice".into()));
         let nonce = hex::encode(rand::random::<[u8; 32]>());
-        let responder = hex::encode(rand::random::<[u8; 32]>());
+        let responder_identity = KeypairFile::generate(Some("responder".into()));
+        let responder = responder_identity.public_key.clone();
         let timestamp = chrono::Utc::now().timestamp();
         let signature = identity
             .sign_bytes(&sync::discovery_auth_payload(timestamp, &nonce, &responder))
             .unwrap();
         let state = AppState {
             datadir: PathBuf::new(),
-            responder,
+            identity: responder_identity,
             discovery_challenges: std::sync::Mutex::new(HashMap::from([(
                 nonce.clone(),
                 timestamp + 60,

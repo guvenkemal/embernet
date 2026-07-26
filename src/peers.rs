@@ -3,10 +3,24 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerRecord {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredPeer {
+    Legacy(String),
+    Record(PeerRecord),
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PeerConfig {
     version: u32,
-    peers: Vec<String>,
+    peers: Vec<StoredPeer>,
 }
 
 fn config_path(datadir: &Path) -> PathBuf {
@@ -29,38 +43,112 @@ pub fn normalize_peer_url(value: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-pub fn list_peers(datadir: &Path) -> Result<Vec<String>> {
+fn validate_public_key(value: &str) -> Result<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let bytes = hex::decode(&normalized).context("peer public key must be hexadecimal")?;
+    if bytes.len() != 32 {
+        bail!("peer public key must encode 32 bytes");
+    }
+    Ok(normalized)
+}
+
+pub fn list_peer_records(datadir: &Path) -> Result<Vec<PeerRecord>> {
     let path = config_path(datadir);
     if !path.exists() {
         return Ok(Vec::new());
     }
     let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    let mut config: PeerConfig =
+    let config: PeerConfig =
         serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
-    config.peers.sort();
-    config.peers.dedup();
-    Ok(config.peers)
+    if !matches!(config.version, 1 | 2) {
+        bail!("unsupported peer configuration version {}", config.version);
+    }
+    let mut records = Vec::<PeerRecord>::new();
+    for stored in config.peers {
+        let mut record = match stored {
+            StoredPeer::Legacy(url) => PeerRecord {
+                url,
+                public_key: None,
+            },
+            StoredPeer::Record(record) => record,
+        };
+        record.url = normalize_peer_url(&record.url)?;
+        record.public_key = record
+            .public_key
+            .as_deref()
+            .map(validate_public_key)
+            .transpose()?;
+        if let Some(existing) = records.iter_mut().find(|peer| peer.url == record.url) {
+            if existing.public_key.is_none() {
+                existing.public_key = record.public_key;
+            } else if record.public_key.is_some() && existing.public_key != record.public_key {
+                bail!("peer {} has conflicting pinned identities", record.url);
+            }
+        } else {
+            records.push(record);
+        }
+    }
+    records.sort_by(|left, right| left.url.cmp(&right.url));
+    Ok(records)
 }
 
-pub fn add_peer(datadir: &Path, value: &str) -> Result<String> {
-    let peer = normalize_peer_url(value)?;
+pub fn list_peers(datadir: &Path) -> Result<Vec<String>> {
+    Ok(list_peer_records(datadir)?
+        .into_iter()
+        .map(|peer| peer.url)
+        .collect())
+}
+
+pub fn expected_peer_key(datadir: &Path, value: &str) -> Result<Option<String>> {
+    let url = normalize_peer_url(value)?;
+    let Some(record) = list_peer_records(datadir)?
+        .into_iter()
+        .find(|peer| peer.url == url)
+    else {
+        return Ok(None);
+    };
+    record.public_key.map(Some).context(format!(
+        "peer {url} is unpinned; add it again with --public-key"
+    ))
+}
+
+pub fn add_peer(datadir: &Path, value: &str, public_key: Option<&str>) -> Result<PeerRecord> {
+    let url = normalize_peer_url(value)?;
+    let public_key = public_key.map(validate_public_key).transpose()?;
     let _lock = lock_config(datadir)?;
-    let mut peers = list_peers(datadir)?;
-    if !peers.contains(&peer) {
-        peers.push(peer.clone());
+    let mut peers = list_peer_records(datadir)?;
+    if let Some(existing) = peers.iter_mut().find(|peer| peer.url == url) {
+        if let Some(public_key) = public_key {
+            if let Some(current) = &existing.public_key
+                && current != &public_key
+            {
+                bail!(
+                    "peer {url} is already pinned to {current}; remove it before trusting a new identity"
+                );
+            }
+            existing.public_key = Some(public_key);
+        }
+    } else {
+        peers.push(PeerRecord {
+            url: url.clone(),
+            public_key,
+        });
     }
-    write_peers(datadir, peers)?;
-    Ok(peer)
+    write_peers(datadir, &peers)?;
+    Ok(peers
+        .into_iter()
+        .find(|peer| peer.url == url)
+        .expect("peer was inserted"))
 }
 
 pub fn remove_peer(datadir: &Path, value: &str) -> Result<bool> {
-    let peer = normalize_peer_url(value)?;
+    let url = normalize_peer_url(value)?;
     let _lock = lock_config(datadir)?;
-    let mut peers = list_peers(datadir)?;
+    let mut peers = list_peer_records(datadir)?;
     let original_len = peers.len();
-    peers.retain(|candidate| candidate != &peer);
+    peers.retain(|candidate| candidate.url != url);
     let removed = peers.len() != original_len;
-    write_peers(datadir, peers)?;
+    write_peers(datadir, &peers)?;
     Ok(removed)
 }
 
@@ -79,12 +167,15 @@ fn lock_config(datadir: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
-fn write_peers(datadir: &Path, mut peers: Vec<String>) -> Result<()> {
+fn write_peers(datadir: &Path, peers: &[PeerRecord]) -> Result<()> {
     std::fs::create_dir_all(datadir)
         .with_context(|| format!("create data directory {}", datadir.display()))?;
-    peers.sort();
-    peers.dedup();
-    let config = PeerConfig { version: 1, peers };
+    let mut peers = peers.to_vec();
+    peers.sort_by(|left, right| left.url.cmp(&right.url));
+    let config = PeerConfig {
+        version: 2,
+        peers: peers.into_iter().map(StoredPeer::Record).collect(),
+    };
     let path = config_path(datadir);
     let temporary = datadir.join(format!("peers.json.tmp-{:016x}", rand::random::<u64>()));
     let mut bytes = serde_json::to_vec_pretty(&config)?;
@@ -108,17 +199,54 @@ mod tests {
         ))
     }
 
+    fn key(byte: u8) -> String {
+        hex::encode([byte; 32])
+    }
+
     #[test]
-    fn peers_are_normalized_deduplicated_and_removed() {
+    fn peers_are_normalized_pinned_and_removed() {
         let datadir = temp_dir();
-        add_peer(&datadir, "ws://localhost:4444").unwrap();
-        add_peer(&datadir, "ws://localhost:4444/sync").unwrap();
+        add_peer(&datadir, "ws://localhost:4444", None).unwrap();
+        let record = add_peer(&datadir, "ws://localhost:4444/sync", Some(&key(1))).unwrap();
+        assert_eq!(record.public_key, Some(key(1)));
         assert_eq!(
             list_peers(&datadir).unwrap(),
             vec!["ws://localhost:4444/sync"]
         );
+        assert_eq!(
+            expected_peer_key(&datadir, "ws://localhost:4444")
+                .unwrap()
+                .unwrap(),
+            key(1)
+        );
         assert!(remove_peer(&datadir, "ws://localhost:4444").unwrap());
         assert!(list_peers(&datadir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_string_peers_load_as_unpinned() {
+        let datadir = temp_dir();
+        std::fs::create_dir_all(&datadir).unwrap();
+        std::fs::write(
+            config_path(&datadir),
+            br#"{"version":1,"peers":["ws://localhost:4444/sync"]}"#,
+        )
+        .unwrap();
+        assert_eq!(list_peer_records(&datadir).unwrap().len(), 1);
+        assert!(expected_peer_key(&datadir, "ws://localhost:4444").is_err());
+    }
+
+    #[test]
+    fn pinned_identity_change_requires_remove() {
+        let datadir = temp_dir();
+        add_peer(&datadir, "ws://localhost:4444", Some(&key(1))).unwrap();
+        assert!(add_peer(&datadir, "ws://localhost:4444", Some(&key(2))).is_err());
+        assert_eq!(
+            expected_peer_key(&datadir, "ws://localhost:4444")
+                .unwrap()
+                .unwrap(),
+            key(1)
+        );
     }
 
     #[test]
@@ -138,7 +266,7 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    add_peer(&datadir, peer).unwrap();
+                    add_peer(&datadir, peer, Some(&key(1))).unwrap();
                 })
             })
             .collect::<Vec<_>>();

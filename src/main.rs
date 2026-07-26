@@ -52,6 +52,9 @@ enum Commands {
         alias: Option<String>,
     },
 
+    /// Show the local node identity used for peer pinning
+    Identity,
+
     /// Create a channel (e.g. tech/discuss)
     ChannelCreate { name: String },
 
@@ -156,7 +159,12 @@ enum Commands {
     Mcp,
 
     /// Save a peer for automatic synchronization
-    PeerAdd { url: String },
+    PeerAdd {
+        url: String,
+        /// Expected Ed25519 identity of the peer
+        #[arg(long)]
+        public_key: String,
+    },
 
     /// List saved peers
     PeerList,
@@ -176,6 +184,9 @@ enum Commands {
         /// Remote peer URL (e.g. ws://127.0.0.1:4444/sync)
         #[arg(long)]
         peer: String,
+        /// Expected peer identity; saves or verifies the pin before syncing
+        #[arg(long)]
+        public_key: Option<String>,
         /// Channel to sync
         channel: String,
     },
@@ -232,6 +243,13 @@ async fn main() -> Result<()> {
         Commands::Init { key, alias } => {
             initialize_identity(&datadir, key.as_deref(), alias)?;
             println!("initialized {}", datadir.display());
+        }
+        Commands::Identity => {
+            let identity = KeypairFile::load_secure(&datadir.join("keys/identity.json"))?;
+            println!("public key: {}", identity.public_key);
+            if let Some(alias) = &identity.alias {
+                println!("alias: {alias}");
+            }
         }
         Commands::ChannelCreate { name } => {
             let chan = ChannelRef::parse(&name)?;
@@ -392,13 +410,21 @@ async fn main() -> Result<()> {
         Commands::Mcp => {
             mcp::run_stdio(datadir)?;
         }
-        Commands::PeerAdd { url } => {
-            let url = peers::add_peer(&datadir, &url)?;
-            println!("peer added: {url}");
+        Commands::PeerAdd { url, public_key } => {
+            let peer = peers::add_peer(&datadir, &url, Some(&public_key))?;
+            println!(
+                "peer pinned: {} -> {}",
+                peer.url,
+                peer.public_key.expect("peer-add requires a public key")
+            );
         }
         Commands::PeerList => {
-            for peer in peers::list_peers(&datadir)? {
-                println!("{peer}");
+            for peer in peers::list_peer_records(&datadir)? {
+                println!(
+                    "{} | {}",
+                    peer.url,
+                    peer.public_key.as_deref().unwrap_or("UNPINNED")
+                );
             }
         }
         Commands::PeerRemove { url } => {
@@ -412,7 +438,16 @@ async fn main() -> Result<()> {
         Commands::Tui { listen } => {
             tui::run(datadir, listen).await?;
         }
-        Commands::Sync { peer, channel } => {
+        Commands::Sync {
+            peer,
+            public_key,
+            channel,
+        } => {
+            if let Some(public_key) = public_key {
+                peers::add_peer(&datadir, &peer, Some(&public_key))?;
+            } else if peers::expected_peer_key(&datadir, &peer)?.is_none() {
+                bail!("direct sync requires --public-key or an existing pinned peer");
+            }
             let received = sync::sync_from_peer(&datadir, &peer, &channel).await?;
             println!(
                 "synced {} messages from {} for channel '{}'",
@@ -531,5 +566,19 @@ mod cli_tests {
                 listen: Some(ref address)
             } if address == "127.0.0.1:4444"
         ));
+    }
+
+    #[test]
+    fn peer_add_requires_an_identity_pin() {
+        assert!(Cli::try_parse_from(["embernet", "peer-add", "ws://127.0.0.1:4444/sync"]).is_err());
+        let cli = Cli::try_parse_from([
+            "embernet",
+            "peer-add",
+            "ws://127.0.0.1:4444/sync",
+            "--public-key",
+            &"01".repeat(32),
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Commands::PeerAdd { .. }));
     }
 }

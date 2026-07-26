@@ -360,7 +360,7 @@ impl App {
                     Ok(format!("posted {}", &id[..12]))
                 }
                 Action::Sync(peer) => {
-                    let peer = peers::add_peer(&self.datadir, &peer)?;
+                    let peer = peers::add_peer(&self.datadir, &peer, None)?.url;
                     self.peers = peers::list_peers(&self.datadir)?;
                     let received = sync::sync_from_peer(&self.datadir, &peer, &channel).await?;
                     self.connection = format!("connected · {peer}");
@@ -536,7 +536,7 @@ async fn run_loop(
             let action = app.handle_key(key)?;
             if let Action::Sync(peer) = action {
                 let channel = app.channel().context("no channel selected")?.to_string();
-                let peer = peers::add_peer(&app.datadir, &peer)?;
+                let peer = peers::add_peer(&app.datadir, &peer, None)?.url;
                 app.peers = peers::list_peers(&app.datadir)?;
                 app.status = format!("syncing · {peer}");
                 let datadir = app.datadir.clone();

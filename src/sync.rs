@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-const SYNC_VERSION: u32 = 8;
+const SYNC_VERSION: u32 = 9;
 const MAX_DIFFERING_IDS: usize = 100_000;
 const MAX_POLICY_EVENTS: usize = 10_000;
 const MAX_MODERATION_EVENTS: usize = 100_000;
@@ -25,12 +25,13 @@ pub(crate) const DISCOVERY_SIGNATURE_HEADER: &str = "x-embernet-signature";
 pub(crate) const DISCOVERY_NONCE_HEADER: &str = "x-embernet-nonce";
 
 #[derive(Debug, Serialize, Deserialize)]
-struct AuthChallenge {
+pub(crate) struct AuthChallenge {
     #[serde(rename = "type", default)]
     msg_type: String,
-    nonce: String,
-    responder: String,
-    expires: i64,
+    pub nonce: String,
+    pub responder: String,
+    pub expires: i64,
+    pub signature: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,12 +150,7 @@ pub async fn handle_sync(ws: WebSocket, state: Arc<AppState>) {
 
 async fn run_sync(mut ws: WebSocket, state: &AppState) -> Result<()> {
     let datadir = &state.datadir;
-    let challenge = AuthChallenge {
-        msg_type: "challenge".into(),
-        nonce: hex::encode(rand::random::<[u8; 32]>()),
-        responder: state.responder.clone(),
-        expires: chrono::Utc::now().timestamp() + 60,
-    };
+    let challenge = make_auth_challenge(&state.identity, "/sync")?;
     ws.send(Message::Text(serde_json::to_string(&challenge)?))
         .await
         .context("send sync authentication challenge")?;
@@ -529,6 +525,8 @@ async fn sync_from_peer_inner(datadir: &Path, peer_url: &str, channel: &str) -> 
 
     let (mut ws, _) = connect_async(peer_url).await.context("connect to peer")?;
     let challenge = read_client_challenge(&mut ws).await?;
+    let expected = crate::peers::expected_peer_key(datadir, peer_url)?;
+    verify_auth_challenge(&challenge, "/sync", expected.as_deref())?;
     let auth_sig = identity.sign_bytes(&sync_auth_payload(
         auth_ts,
         channel,
@@ -713,6 +711,40 @@ async fn read_client_challenge(
     if challenge.msg_type != "challenge" {
         bail!("expected type=challenge");
     }
+    Ok(challenge)
+}
+
+fn responder_challenge_payload(
+    target: &str,
+    nonce: &str,
+    responder: &str,
+    expires: i64,
+) -> Vec<u8> {
+    format!("embernet-responder-challenge-v1\n{target}\n{nonce}\n{responder}\n{expires}")
+        .into_bytes()
+}
+
+pub(crate) fn make_auth_challenge(identity: &KeypairFile, target: &str) -> Result<AuthChallenge> {
+    let nonce = hex::encode(rand::random::<[u8; 32]>());
+    let expires = chrono::Utc::now().timestamp() + 60;
+    let payload = responder_challenge_payload(target, &nonce, &identity.public_key, expires);
+    Ok(AuthChallenge {
+        msg_type: "challenge".into(),
+        nonce,
+        responder: identity.public_key.clone(),
+        expires,
+        signature: identity.sign_bytes(&payload)?,
+    })
+}
+
+fn verify_auth_challenge(
+    challenge: &AuthChallenge,
+    target: &str,
+    expected: Option<&str>,
+) -> Result<()> {
+    if challenge.msg_type != "challenge" {
+        bail!("expected type=challenge");
+    }
     if challenge.expires < chrono::Utc::now().timestamp()
         || challenge.expires > chrono::Utc::now().timestamp() + 60
     {
@@ -722,7 +754,25 @@ async fn read_client_challenge(
     if nonce.len() != 32 {
         bail!("challenge nonce must contain 32 bytes");
     }
-    Ok(challenge)
+    if let Some(expected) = expected
+        && challenge.responder != expected
+    {
+        bail!(
+            "peer identity mismatch: expected {expected}, received {}",
+            challenge.responder
+        );
+    }
+    verify_bytes(
+        &challenge.responder,
+        &challenge.signature,
+        &responder_challenge_payload(
+            target,
+            &challenge.nonce,
+            &challenge.responder,
+            challenge.expires,
+        ),
+    )
+    .context("invalid responder challenge signature")
 }
 
 fn sync_auth_payload(timestamp: i64, channel: &str, nonce: &str, responder: &str) -> Vec<u8> {
@@ -763,11 +813,8 @@ pub async fn discover_peer_channels(datadir: &Path, peer_url: &str) -> Result<Ve
         .json()
         .await
         .context("decode discovery challenge")?;
-    if challenge.expires < chrono::Utc::now().timestamp()
-        || challenge.expires > chrono::Utc::now().timestamp() + 60
-    {
-        bail!("invalid discovery challenge expiry");
-    }
+    let expected = crate::peers::expected_peer_key(datadir, peer_url)?;
+    verify_auth_challenge(&challenge, "/status", expected.as_deref())?;
     let timestamp = chrono::Utc::now().timestamp();
     let signature = identity.sign_bytes(&discovery_auth_payload(
         timestamp,
@@ -867,6 +914,58 @@ mod tests {
         accept_requested_id(&mut wanted, "first").unwrap();
         assert!(accept_requested_id(&mut wanted, "first").is_err());
         assert_eq!(wanted, HashSet::from(["second".to_string()]));
+    }
+
+    #[test]
+    fn responder_challenge_requires_its_signer_and_expected_pin() {
+        let responder = KeypairFile::generate(Some("responder".into()));
+        let other = KeypairFile::generate(Some("other".into()));
+        let challenge = make_auth_challenge(&responder, "/sync").unwrap();
+        verify_auth_challenge(&challenge, "/sync", Some(&responder.public_key)).unwrap();
+        assert!(verify_auth_challenge(&challenge, "/status", None).is_err());
+        assert!(verify_auth_challenge(&challenge, "/sync", Some(&other.public_key)).is_err());
+
+        let mut forged = challenge;
+        forged.responder = other.public_key.clone();
+        assert!(verify_auth_challenge(&forged, "/sync", None).is_err());
+    }
+
+    #[tokio::test]
+    async fn pinned_peer_rejects_a_different_responder_identity() {
+        let server_dir = temp_dir("pin_server");
+        let client_dir = temp_dir("pin_client");
+        for dir in [&server_dir, &client_dir] {
+            init_layout(dir).unwrap();
+        }
+        let server_identity = ensure_identity(&server_dir);
+        ensure_identity(&client_dir);
+        let chan = ChannelRef::parse("test/pinning").unwrap();
+        create_channel(&server_dir, &chan).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::server::router(server_dir);
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let peer = format!("ws://{addr}/sync");
+
+        crate::peers::add_peer(&client_dir, &peer, Some(&server_identity.public_key)).unwrap();
+        assert_eq!(
+            discover_peer_channels(&client_dir, &peer).await.unwrap(),
+            vec!["test/pinning"]
+        );
+        crate::peers::remove_peer(&client_dir, &peer).unwrap();
+        crate::peers::add_peer(
+            &client_dir,
+            &peer,
+            Some(&KeypairFile::generate(None).public_key),
+        )
+        .unwrap();
+        assert!(discover_peer_channels(&client_dir, &peer).await.is_err());
+        assert!(
+            sync_from_peer(&client_dir, &peer, &chan.full_name)
+                .await
+                .is_err()
+        );
+        task.abort();
     }
 
     fn ensure_identity(base: &Path) -> KeypairFile {

@@ -14,6 +14,10 @@ the protocol but did not provide a practical ongoing conversation.
 Nodes store a sorted, deduplicated list of WebSocket peer URLs in `peers.json`.
 The CLI manages this list with `peer-add`, `peer-list`, and `peer-remove`.
 
+> [!NOTE]
+> [[adr-016-peer-identity-pinning]] upgrades these URL strings to version-2
+> URL-plus-public-key records. Legacy strings remain readable but are unpinned.
+
 The existing HTTP status endpoint returns all locally known channel names,
 including nested names. Every three seconds, a TUI background task reloads the
 peer list, discovers each peer's channels, creates missing local channel shells,

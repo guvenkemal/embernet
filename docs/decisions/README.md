@@ -23,6 +23,7 @@ Start from [[adr-template]].
 - [[adr-013-private-channel-membership]] — Authenticate discovery and sync against signed membership.
 - [[adr-014-private-channel-encryption]] — Encrypt private message bodies and exchange channel keys between members.
 - [[adr-015-protocol-hardening]] — Bind authentication to one-time challenges and harden local durability.
+- [[adr-016-peer-identity-pinning]] — Pin signed responder identities for persistent peers.
 
 ## Suggested ADRs
 

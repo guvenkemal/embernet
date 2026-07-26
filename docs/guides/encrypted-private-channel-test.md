@@ -31,7 +31,7 @@ cd ~/Projects/embernet
 cargo build
 ```
 
-All nodes must run the same build. Sync v8 is not compatible with earlier sync
+All nodes must run the same build. Sync v9 is not compatible with earlier sync
 versions.
 
 ## 3. Reset the test data
@@ -173,7 +173,8 @@ In **terminal 2**:
 cd ~/Projects/embernet
 
 ./target/debug/embernet --data ~/.embernet-bob \
-  peer-add ws://127.0.0.1:4444/sync
+  peer-add ws://127.0.0.1:4444/sync \
+  --public-key "$(jq -r .public_key ~/.embernet-alice/keys/identity.json)"
 
 ./target/debug/embernet \
   --data ~/.embernet-bob \
@@ -223,7 +224,8 @@ In **terminal 3**:
 cd ~/Projects/embernet
 
 ./target/debug/embernet --data ~/.embernet-john \
-  peer-add ws://127.0.0.1:4444/sync
+  peer-add ws://127.0.0.1:4444/sync \
+  --public-key "$(jq -r .public_key ~/.embernet-alice/keys/identity.json)"
 
 ./target/debug/embernet \
   --data ~/.embernet-john \

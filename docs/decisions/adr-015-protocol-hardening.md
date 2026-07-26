@@ -49,9 +49,8 @@ operations could wait indefinitely.
   observing a partial record.
 - Local secret files no longer depend on a permissive system umask.
 
-An active relay can still proxy an unpinned responder challenge. Authenticating
-remote node identities through peer pinning or a trust-on-first-use model remains
-future work.
+[[adr-016-peer-identity-pinning]] subsequently authenticates signed responder
+challenges against explicit pins for persistent peers.
 
 Related: [[adr-003-locked-durable-channel-appends]],
 [[adr-013-private-channel-membership]], [[adr-014-private-channel-encryption]],

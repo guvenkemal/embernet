@@ -36,6 +36,7 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 - Authenticated private-channel synchronization ✅
 - End-to-end encrypted private message bodies and membership-key rotation ✅
 - Challenge-bound replay-resistant authentication and security hardening ✅
+- Signed responder challenges and strict saved-peer identity pinning ✅
 - next: encrypt private message metadata and add explicit key recovery/export.
 - planned: Web UI client.
 
@@ -58,13 +59,14 @@ Related: [[../protocol/protocol]], [[../research/prior-art]]
 
 ## Current status
 
-Phase 1 is active. Sync v8 uses one-time responder-bound challenges to authenticate
+Phase 1 is active. Sync v9 uses signed, one-time responder-bound challenges to authenticate
 the initiating identity, enforces private
 membership, and reconciles signed policy and moderation histories before
 exchanging member-wrapped encryption keys and using deterministic Merkle buckets
 to localize divergent messages. Private message bodies use XChaCha20-Poly1305;
-X25519 exchange keys are derived from the existing Ed25519 identities. Saved peers let
-the terminal client discover channels and synchronize them periodically without
+X25519 exchange keys are derived from the existing Ed25519 identities. Saved peers
+let the terminal client pin responder identities, discover channels, and synchronize
+them periodically without
 blocking rendering or input. A lightweight local fingerprint also refreshes the
 selected timeline when another process writes to the same data directory. CLI,
 MCP, and the terminal client all use the same protocol and storage core.

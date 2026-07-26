@@ -226,7 +226,14 @@ GET /challenge
 ```
 
 The response contains a random 32-byte hexadecimal `nonce`, the responder's
-identity, and an expiry. The client then sends `x-embernet-public-key`,
+identity, an expiry, and an Ed25519 signature over:
+
+```text
+embernet-responder-challenge-v1\n/status\n<nonce>\n<responder>\n<expiry>
+```
+
+Saved peers compare the signed responder with their pinned public key before
+proceeding. The client then sends `x-embernet-public-key`,
 `x-embernet-timestamp`, `x-embernet-nonce`, and `x-embernet-signature` headers to
 `GET /status`. The signature covers:
 
@@ -244,7 +251,7 @@ The current sync protocol is implemented over WebSocket at:
 GET /sync
 ```
 
-Sync v8 reconciles one channel per connection. The responder first sends a
+Sync v9 reconciles one channel per connection. The responder first sends a
 socket-specific challenge:
 
 ```json
@@ -252,9 +259,15 @@ socket-specific challenge:
   "type": "challenge",
   "nonce": "32-byte-hex-nonce",
   "responder": "responder-public-key-hex",
-  "expires": 1784990060
+  "expires": 1784990060,
+  "signature": "responder-signature-hex"
 }
 ```
+
+The signature covers
+`embernet-responder-challenge-v1\n/sync\n<nonce>\n<responder>\n<expiry>`.
+Clients verify both the signature and the responder's pinned identity before
+signing the opening packet.
 
 The opening client packet authenticates the requester with a signature bound to
 the timestamp, channel, nonce, and responder. Private channels
@@ -281,7 +294,7 @@ into 256 buckets. Each bucket hash is BLAKE3 over its lexicographically sorted r
 ```json
 {
   "type": "status",
-  "version": 8,
+  "version": 9,
   "channel": "tech/linux",
   "requester": "ed25519-public-key-hex",
   "auth_ts": 1784990000,
@@ -297,7 +310,7 @@ Fields:
 | Field | Type | Description |
 | --- | --- | --- |
 | `type` | string | Must be `"status"`. |
-| `version` | integer | Must be `8`. |
+| `version` | integer | Must be `9`. |
 | `channel` | string | Channel to synchronize. |
 | `requester` | string | Ed25519 public key of the initiating node. |
 | `auth_ts` | integer | Unix timestamp, accepted within 60 seconds. |
@@ -353,7 +366,9 @@ so retrying a partially completed sync is safe.
 - Revoked members retain data and historical keys synchronized before revocation.
 - Channel membership and visibility are visible to authorized peers in policy
   history.
-- Sync v7 peers are not wire-compatible with v8.
+- Persistent peers require an explicit identity pin. Unsaved library-level
+  connections are only opportunistically authenticated.
+- Sync v8 peers are not wire-compatible with v9.
 - Policy histories are sent in full before every exchange.
 - Moderation histories are sent in full before every exchange.
 - Historical messages are authorized against current policy state rather than the
